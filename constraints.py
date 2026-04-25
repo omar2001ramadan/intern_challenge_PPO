@@ -62,10 +62,11 @@ def all_branch_signed_constraints(centers, widths, heights, pairs):
     )
 
 
-def soft_signed_disjunction(centers, widths, heights, pairs, branch_weights, tau=1.0):
+def soft_signed_disjunction(centers, widths, heights, pairs, branch_weights, tau=1.0, epsilon=1e-4):
     """Soft minimum of signed branch constraints for continuation training."""
     constraints = all_branch_signed_constraints(centers, widths, heights, pairs)
-    weights = torch.clamp(branch_weights, min=1e-8)
+    weights = torch.clamp(branch_weights, min=0.0) + float(epsilon)
+    weights = weights / torch.clamp(weights.sum(dim=1, keepdim=True), min=1e-8)
     log_terms = torch.log(weights) - constraints / max(float(tau), 1e-6)
     return -float(tau) * torch.logsumexp(log_terms, dim=1)
 

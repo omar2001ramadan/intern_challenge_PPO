@@ -108,6 +108,8 @@ def build_graph_state(
     wirelength_grad=None,
     density_pressure=None,
     memory=None,
+    exact_overlap_ratio=None,
+    stop_logit_bias=None,
 ):
     """Build a policy graph dictionary from placement state tensors."""
     if active_pairs is None:
@@ -124,6 +126,10 @@ def build_graph_state(
         density_pressure = torch.zeros(cell_features.shape[0], dtype=cell_features.dtype, device=cell_features.device)
     if memory is None:
         memory = torch.zeros(0, dtype=cell_features.dtype, device=cell_features.device)
+    if exact_overlap_ratio is None:
+        exact_overlap_ratio = torch.zeros((), dtype=cell_features.dtype, device=cell_features.device)
+    if stop_logit_bias is None:
+        stop_logit_bias = torch.zeros((), dtype=cell_features.dtype, device=cell_features.device)
     return {
         "cell_features": cell_features.detach(),
         "pin_features": pin_features.detach(),
@@ -135,6 +141,8 @@ def build_graph_state(
         "wirelength_grad": wirelength_grad.detach(),
         "density_pressure": density_pressure.detach(),
         "memory": memory.detach(),
+        "exact_overlap_ratio": exact_overlap_ratio.detach() if torch.is_tensor(exact_overlap_ratio) else torch.tensor(float(exact_overlap_ratio), dtype=cell_features.dtype, device=cell_features.device),
+        "stop_logit_bias": stop_logit_bias.detach() if torch.is_tensor(stop_logit_bias) else torch.tensor(float(stop_logit_bias), dtype=cell_features.dtype, device=cell_features.device),
     }
 
 
@@ -790,7 +798,10 @@ class OrderingPolicy(nn.Module):
         else:
             k_index = torch.distributions.Categorical(logits=k_logits).sample()
 
-        stop_logits = self.stop_head(context).squeeze(-1)
+        stop_logits = self.stop_head(context).squeeze(-1) + graph.get(
+            "stop_logit_bias",
+            torch.zeros((), dtype=h.dtype, device=h.device),
+        ).to(dtype=h.dtype, device=h.device)
         if deterministic:
             stop = (torch.sigmoid(stop_logits) > 0.5).to(dtype=h.dtype)
         else:
@@ -927,7 +938,10 @@ class OrderingPolicy(nn.Module):
         control_log_std = torch.clamp(control_params[len(CONTROL_NAMES) :], min=-4.0, max=1.0)
 
         k_logits = self.k_head(context)
-        stop_logits = self.stop_head(context).squeeze(-1)
+        stop_logits = self.stop_head(context).squeeze(-1) + graph.get(
+            "stop_logit_bias",
+            torch.zeros((), dtype=h.dtype, device=h.device),
+        ).to(dtype=h.dtype, device=h.device)
         cluster_logits = self.cluster_head(h)
         std_mask = self._standard_cell_mask(graph)
         cluster_h = self._cluster_embeddings(h, action.cluster_ids, context)

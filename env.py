@@ -44,9 +44,23 @@ class EnvConfig:
     soft_tau: float = 1.0
     exact_overlap_reward_coef: float = 1.0
     exact_wirelength_reward_coef: float = 0.20
+    reward_mode: str = "aligned"
+    lag_reward_coef: float = 1.0
+    exact_overlap_regression_coef: float = 8.0
+    exact_wirelength_gate_epsilon: float = 0.002
+    branch_violation_penalty_coef: float = 2.0
+    missed_pair_penalty_coef: float = 0.01
     movement_penalty_coef: float = 0.001
     stop_overlap_penalty: float = 2.0
+    stop_no_progress_penalty: float = 2.0
     stop_wirelength_coef: float = 0.25
+    enable_stop_gate: bool = True
+    stop_gate_overlap_threshold: float = 0.02
+    stop_gate_penalty: float = 4.0
+    soft_branch_epsilon: float = 1e-4
+    rho_min: float = 0.05
+    rho_max: float = 128.0
+    dual_max: float = 10_000.0
     repair_candidates: bool = False
     enable_residual_flow: bool = True
     enable_phr_layer: bool = True
@@ -126,6 +140,16 @@ class PlacementOrderingEnv:
 
     def graph_state(self, memory=None):
         density_g, assignment = self._density_constraints(self.centers)
+        current_score = self._score_centers(self.centers)
+        overlap_ratio = torch.tensor(
+            current_score["overlap_ratio"],
+            dtype=self.centers.dtype,
+            device=self.centers.device,
+        )
+        if self.config.enable_stop_gate and current_score["overlap_ratio"] > self.config.stop_gate_overlap_threshold:
+            stop_logit_bias = -float(self.config.stop_gate_penalty)
+        else:
+            stop_logit_bias = 0.0
         return build_graph_state(
             write_positions(self.cell_features, self.centers),
             self.pin_features,
@@ -137,6 +161,8 @@ class PlacementOrderingEnv:
             self._wirelength_gradient(),
             density_pressure_per_cell(density_g, assignment, self.density_duals),
             memory,
+            exact_overlap_ratio=overlap_ratio,
+            stop_logit_bias=stop_logit_bias,
         )
 
     def _density_constraints(self, centers):
@@ -243,20 +269,10 @@ class PlacementOrderingEnv:
         )
 
         after_score = self._score_centers(next_centers)
-        exact_reward = (
-            self.config.exact_overlap_reward_coef * (before_score["overlap_ratio"] - after_score["overlap_ratio"])
-            + self.config.exact_wirelength_reward_coef * (before_score["normalized_wl"] - after_score["normalized_wl"])
-        )
         movement_penalty = self.config.movement_penalty_coef * (
             (next_centers - self.centers).square().mean() / torch.clamp(self.length_scale.square(), min=1.0)
         ).detach().item()
         entropy_term = 0.0 if entropy is None else float(entropy.detach().item())
-        reward = (
-            (lag_before.detach() - lag_after.detach()).item()
-            + exact_reward
-            + self.config.entropy_reward_coef * entropy_term
-            - movement_penalty
-        )
 
         self.centers = next_centers.detach()
         if self.config.enable_phr_layer:
@@ -266,6 +282,10 @@ class PlacementOrderingEnv:
                 old_boundary_duals,
                 old_density_duals,
                 rho=rho,
+                pressure=pressure,
+                branch_pressure_values=per_constraint_pressure["branch"],
+                boundary_pressure_values=per_constraint_pressure["boundary"],
+                density_pressure_values=per_constraint_pressure["density"],
                 soft_branch_weights=active_soft_weights,
                 soft_tau=active_soft_tau,
             )
@@ -282,12 +302,22 @@ class PlacementOrderingEnv:
                 pair_emphasis=float(action.pair_emphasis.detach().item()),
             )
         score = self._save_candidate(self.centers)
+        reward, reward_terms = self._aligned_reward(
+            lag_before,
+            lag_after,
+            before_score,
+            score,
+            after_logs,
+            audit_info,
+            entropy_term,
+            movement_penalty,
+        )
 
         self.step_index += 1
         stopped = bool(action.stop.detach().item() >= 0.5)
         done = stopped or self.step_index >= self.config.horizon
         if stopped:
-            reward += self._stop_reward(score)
+            reward += self._stop_reward(score, before_score)
         elif done:
             reward += self.terminal_reward()
 
@@ -312,7 +342,7 @@ class PlacementOrderingEnv:
             "tau": active_soft_tau,
             "stop": stopped,
             "residual_norm": float(residual.norm(dim=1).mean().detach().item()),
-            "exact_reward": exact_reward,
+            **reward_terms,
             "movement_penalty": movement_penalty,
             "branch_pressure": pressure["branch"],
             "density_pressure": pressure["density"],
@@ -320,9 +350,59 @@ class PlacementOrderingEnv:
             "branch_pressure_mean": self._tensor_mean(per_constraint_pressure["branch"]),
             "boundary_pressure_mean": self._tensor_mean(per_constraint_pressure["boundary"]),
             "density_pressure_mean": self._tensor_mean(per_constraint_pressure["density"]),
+            "dual_clamp_fraction": getattr(self, "last_dual_clamp_fraction", 0.0),
             **audit_info,
         }
         return reward, done, info
+
+    def _aligned_reward(
+        self,
+        lag_before,
+        lag_after,
+        before_score,
+        after_score,
+        after_logs,
+        audit_info,
+        entropy_term,
+        movement_penalty,
+    ):
+        lag_delta = (lag_before.detach() - lag_after.detach()).item()
+        overlap_delta = before_score["overlap_ratio"] - after_score["overlap_ratio"]
+        wirelength_delta = before_score["normalized_wl"] - after_score["normalized_wl"]
+        overlap_regression = max(-overlap_delta, 0.0)
+        gated_wire_delta = wirelength_delta if overlap_delta >= -self.config.exact_wirelength_gate_epsilon else 0.0
+        exact_reward = (
+            self.config.exact_overlap_reward_coef * overlap_delta
+            - self.config.exact_overlap_regression_coef * overlap_regression
+            + self.config.exact_wirelength_reward_coef * gated_wire_delta
+        )
+        violation_penalty = self.config.branch_violation_penalty_coef * after_logs["branch_violation"]
+        missed_pair_penalty = self.config.missed_pair_penalty_coef * float(audit_info.get("missed_pairs", 0))
+        if self.config.reward_mode == "legacy":
+            exact_reward = (
+                self.config.exact_overlap_reward_coef * overlap_delta
+                + self.config.exact_wirelength_reward_coef * wirelength_delta
+            )
+            violation_penalty = 0.0
+            missed_pair_penalty = 0.0
+        reward = (
+            self.config.lag_reward_coef * lag_delta
+            + exact_reward
+            + self.config.entropy_reward_coef * entropy_term
+            - movement_penalty
+            - violation_penalty
+            - missed_pair_penalty
+        )
+        return reward, {
+            "lag_reward": self.config.lag_reward_coef * lag_delta,
+            "exact_reward": exact_reward,
+            "overlap_delta": overlap_delta,
+            "wirelength_delta": wirelength_delta,
+            "gated_wirelength_delta": gated_wire_delta,
+            "overlap_regression_penalty": self.config.exact_overlap_regression_coef * overlap_regression,
+            "branch_violation_penalty": violation_penalty,
+            "missed_pair_penalty": missed_pair_penalty,
+        }
 
     def _per_constraint_pressure(self, action):
         if self.config.fixed_pd_controls:
@@ -353,6 +433,14 @@ class PlacementOrderingEnv:
         if value is None or value.numel() == 0:
             return 0.0
         return float(value.detach().mean().item())
+
+    def _effective_rho(self, rho, group_pressure=1.0, pressure_values=None, like=None):
+        if like is None:
+            return float(max(min(rho * group_pressure, self.config.rho_max), self.config.rho_min))
+        rho_e = torch.full_like(like, float(rho) * float(group_pressure))
+        if pressure_values is not None and pressure_values.numel() == like.numel():
+            rho_e = rho_e * pressure_values.reshape_as(like).to(dtype=like.dtype, device=like.device)
+        return torch.clamp(rho_e, min=float(self.config.rho_min), max=float(self.config.rho_max))
 
     def step(self, seq_plus, seq_minus, entropy=None, soft_branch_weights=None, soft_tau=None):
         branches = induce_branches_from_sequence_pair(seq_plus, seq_minus, self.active_pairs)
@@ -563,7 +651,7 @@ class PlacementOrderingEnv:
                 active_lam = branch_duals[pair_idx, branches]
                 branch_g = branch_signed_constraints(centers, widths, heights, self.active_pairs, branches) / self.length_scale
             else:
-                weights = torch.clamp(soft_branch_weights, min=1e-8)
+                weights = torch.clamp(soft_branch_weights, min=0.0) + float(self.config.soft_branch_epsilon)
                 weights = weights / torch.clamp(weights.sum(dim=1, keepdim=True), min=1e-8)
                 active_lam = (branch_duals * weights).sum(dim=1)
                 branch_g = (
@@ -574,15 +662,21 @@ class PlacementOrderingEnv:
                         self.active_pairs,
                         weights,
                         tau=self.config.soft_tau if soft_tau is None else soft_tau,
+                        epsilon=self.config.soft_branch_epsilon,
                     )
                     / self.length_scale
                 )
             branch_g_al = torch.relu(branch_g) if self.config.al_mode == "positive_only" else branch_g
+            branch_rho = self._effective_rho(
+                rho_value,
+                pressure.get("branch", 1.0),
+                branch_pressure_values,
+                branch_g_al,
+            )
             branch_al = phr_inequality_penalty(
                 branch_g_al,
                 active_lam,
-                rho_value,
-                weights=branch_pressure_values,
+                branch_rho,
             )
             overlap_loss = overlap_repulsion_for_pairs(centers, widths, heights, self.active_pairs, self.area_scale)
             branch_violation = torch.relu(branch_g).mean().detach().item()
@@ -593,19 +687,29 @@ class PlacementOrderingEnv:
 
         boundary_g = boundary_signed_constraints(centers, widths, heights, self.bounds) / self.length_scale
         boundary_g_al = torch.relu(boundary_g) if self.config.al_mode == "positive_only" else boundary_g
+        boundary_rho = self._effective_rho(
+            rho_value,
+            pressure.get("boundary", 1.0),
+            boundary_pressure_values,
+            boundary_g_al.reshape(-1),
+        )
         boundary_al = phr_inequality_penalty(
             boundary_g_al.reshape(-1),
             boundary_duals.reshape(-1),
-            rho_value,
-            weights=None if boundary_pressure_values is None else boundary_pressure_values.reshape(-1),
+            boundary_rho,
         )
         density_g, _assignment = self._density_constraints(centers)
         density_g_al = torch.relu(density_g) if self.config.al_mode == "positive_only" else density_g
+        density_rho = self._effective_rho(
+            rho_value,
+            pressure.get("density", 1.0),
+            density_pressure_values,
+            density_g_al,
+        )
         density_al = phr_inequality_penalty(
             density_g_al,
             density_duals,
-            rho_value,
-            weights=density_pressure_values,
+            density_rho,
         )
         density_v = density_spread_violation(centers, self.cell_features) / self.length_scale
         if not self.config.enable_density:
@@ -614,10 +718,10 @@ class PlacementOrderingEnv:
 
         total = (
             self.config.lambda_wirelength * wl
-            + float(pressure.get("branch", 1.0)) * (2.0 * self.config.lambda_overlap) * branch_al
+            + (2.0 * self.config.lambda_overlap) * branch_al
             + (10.0 * self.config.lambda_overlap) * overlap_loss
-            + float(pressure.get("boundary", 1.0)) * 0.10 * self.config.lambda_overlap * boundary_al
-            + float(pressure.get("density", 1.0)) * self.config.lambda_density * density_al
+            + 0.10 * self.config.lambda_overlap * boundary_al
+            + self.config.lambda_density * density_al
             + 0.05 * self.config.lambda_density * density_v.square().sum()
             + eta_value * prox
         )
@@ -683,22 +787,38 @@ class PlacementOrderingEnv:
         old_boundary_duals,
         old_density_duals,
         rho=None,
+        pressure=None,
+        branch_pressure_values=None,
+        boundary_pressure_values=None,
+        density_pressure_values=None,
         soft_branch_weights=None,
         soft_tau=None,
     ):
         rho_value = self.config.rho if rho is None else float(rho)
+        pressure = pressure or {"branch": 1.0, "density": 1.0, "boundary": 1.0}
         widths = self.cell_features[:, 4]
         heights = self.cell_features[:, 5]
+        clamp_count = 0
+        dual_count = 0
         if self.active_pairs.numel() > 0:
             pair_idx = torch.arange(self.active_pairs.shape[0], device=self.centers.device)
             if soft_branch_weights is None:
                 active_lam = old_branch_duals[pair_idx, branches]
                 branch_g = branch_signed_constraints(self.centers, widths, heights, self.active_pairs, branches) / self.length_scale
                 branch_update_g = torch.relu(branch_g) if self.config.al_mode == "positive_only" else branch_g
+                branch_rho = self._effective_rho(
+                    rho_value,
+                    pressure.get("branch", 1.0),
+                    branch_pressure_values,
+                    branch_update_g,
+                )
                 self.branch_duals = old_branch_duals * 0.92
-                self.branch_duals[pair_idx, branches] = phr_dual_update(active_lam, branch_update_g, rho_value)
+                updated = phr_dual_update(active_lam, branch_update_g, branch_rho, max_value=self.config.dual_max)
+                clamp_count += int((updated >= self.config.dual_max - 1e-6).sum().item())
+                dual_count += int(updated.numel())
+                self.branch_duals[pair_idx, branches] = updated
             else:
-                weights = torch.clamp(soft_branch_weights, min=1e-8)
+                weights = torch.clamp(soft_branch_weights, min=0.0) + float(self.config.soft_branch_epsilon)
                 weights = weights / torch.clamp(weights.sum(dim=1, keepdim=True), min=1e-8)
                 active_lam = (old_branch_duals * weights).sum(dim=1)
                 branch_g = (
@@ -709,19 +829,46 @@ class PlacementOrderingEnv:
                         self.active_pairs,
                         weights,
                         tau=self.config.soft_tau if soft_tau is None else soft_tau,
+                        epsilon=self.config.soft_branch_epsilon,
                     )
                     / self.length_scale
                 )
                 branch_update_g = torch.relu(branch_g) if self.config.al_mode == "positive_only" else branch_g
-                updated_lam = phr_dual_update(active_lam, branch_update_g, rho_value)
+                branch_rho = self._effective_rho(
+                    rho_value,
+                    pressure.get("branch", 1.0),
+                    branch_pressure_values,
+                    branch_update_g,
+                )
+                updated_lam = phr_dual_update(active_lam, branch_update_g, branch_rho, max_value=self.config.dual_max)
+                clamp_count += int((updated_lam >= self.config.dual_max - 1e-6).sum().item())
+                dual_count += int(updated_lam.numel())
                 self.branch_duals = old_branch_duals * 0.92 + weights * updated_lam.unsqueeze(1)
+            self.branch_duals = torch.clamp(self.branch_duals, min=0.0, max=float(self.config.dual_max))
 
         boundary_g = boundary_signed_constraints(self.centers, widths, heights, self.bounds) / self.length_scale
         boundary_update_g = torch.relu(boundary_g) if self.config.al_mode == "positive_only" else boundary_g
-        self.boundary_duals = phr_dual_update(old_boundary_duals, boundary_update_g, rho_value)
+        boundary_rho = self._effective_rho(
+            rho_value,
+            pressure.get("boundary", 1.0),
+            boundary_pressure_values,
+            boundary_update_g,
+        )
+        self.boundary_duals = phr_dual_update(old_boundary_duals, boundary_update_g, boundary_rho, max_value=self.config.dual_max)
+        clamp_count += int((self.boundary_duals >= self.config.dual_max - 1e-6).sum().item())
+        dual_count += int(self.boundary_duals.numel())
         density_g, _assignment = self._density_constraints(self.centers)
         density_update_g = torch.relu(density_g) if self.config.al_mode == "positive_only" else density_g
-        self.density_duals = phr_dual_update(old_density_duals, density_update_g, rho_value)
+        density_rho = self._effective_rho(
+            rho_value,
+            pressure.get("density", 1.0),
+            density_pressure_values,
+            density_update_g,
+        )
+        self.density_duals = phr_dual_update(old_density_duals, density_update_g, density_rho, max_value=self.config.dual_max)
+        clamp_count += int((self.density_duals >= self.config.dual_max - 1e-6).sum().item())
+        dual_count += int(self.density_duals.numel())
+        self.last_dual_clamp_fraction = float(clamp_count) / max(float(dual_count), 1.0)
 
     def _audit_active_set(self, action=None, cluster_ids=None, pair_emphasis=0.0):
         current = write_positions(self.cell_features, self.centers)
@@ -872,11 +1019,16 @@ class PlacementOrderingEnv:
             "normalized_wl": normalized_wirelength(current, self.pin_features, self.edge_list),
         }
 
-    def _stop_reward(self, score):
+    def _stop_reward(self, score, before_score=None):
         feasible = 1.0 if score["overlap_cells"] == 0 else 0.0
+        if feasible:
+            return self.config.terminal_feasible_bonus - self.config.stop_wirelength_coef * score["normalized_wl"]
+        no_progress = 0.0
+        if before_score is not None and score["overlap_ratio"] >= before_score["overlap_ratio"]:
+            no_progress = float(self.config.stop_no_progress_penalty)
         return (
-            self.config.terminal_feasible_bonus * feasible
-            - self.config.stop_overlap_penalty * score["overlap_ratio"]
+            -self.config.stop_overlap_penalty * (1.0 + score["overlap_ratio"])
+            - no_progress
             - self.config.stop_wirelength_coef * score["normalized_wl"]
         )
 

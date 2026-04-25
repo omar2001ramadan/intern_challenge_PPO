@@ -13,9 +13,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from env import EnvConfig
-from ordering_policy import OrderingPolicy, save_policy_checkpoint
+from ordering_policy import OrderingPolicy, load_policy_checkpoint, save_policy_checkpoint
 from ppo import ppo_update
-from train_ppo import collect_episode, parse_sizes, soft_tau_at, temperature_at
+from train_ppo import collect_episode, parse_sizes, soft_tau_at, temperature_at, update_metric_gated_tau, validate_policy
 
 
 def broadcast_parameters(module, src=0):
@@ -66,13 +66,27 @@ def worker(local_rank, world_size, args):
         ordering_representation=args.ordering_representation,
         branch_mode=args.branch_mode,
         al_mode=args.al_mode,
+        reward_mode=args.reward_mode,
+        lag_reward_coef=args.lag_reward_coef,
+        exact_overlap_reward_coef=args.overlap_reward_coef,
+        exact_overlap_regression_coef=args.overlap_regression_coef,
+        exact_wirelength_reward_coef=args.wirelength_reward_coef,
+        branch_violation_penalty_coef=args.branch_violation_penalty,
+        missed_pair_penalty_coef=args.missed_pair_penalty,
+        stop_gate_penalty=args.stop_gate_penalty,
+        stop_gate_overlap_threshold=args.stop_gate_overlap,
+        stop_no_progress_penalty=args.stop_no_progress_penalty,
+        soft_branch_epsilon=args.soft_branch_epsilon,
     )
-    policy = OrderingPolicy(
-        hidden_dim=args.hidden_dim,
-        message_passes=args.message_passes,
-        num_clusters=args.num_clusters,
-        global_flow_rank=args.global_flow_rank,
-    ).to(device)
+    if args.resume_checkpoint:
+        policy, _checkpoint = load_policy_checkpoint(args.resume_checkpoint, device)
+    else:
+        policy = OrderingPolicy(
+            hidden_dim=args.hidden_dim,
+            message_passes=args.message_passes,
+            num_clusters=args.num_clusters,
+            global_flow_rank=args.global_flow_rank,
+        ).to(device)
     broadcast_parameters(policy, src=0)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
@@ -84,13 +98,22 @@ def worker(local_rank, world_size, args):
 
     best_overlap = float("inf")
     best_wl = float("inf")
+    best_validation_overlap = float("inf")
+    best_validation_wl = float("inf")
+    best_reward = -float("inf")
+    hardening_state = {"best_overlap": float("inf"), "bad_windows": 0}
+    soft_tau_state = float(args.soft_tau_start)
     started = time.time()
 
     for update_idx in range(args.updates):
         temperature = temperature_at(update_idx, args.updates)
-        soft_cutoff = int(args.updates * args.soft_relax_frac)
-        use_soft = (not args.no_soft_relax) and update_idx < soft_cutoff
-        soft_tau = soft_tau_at(update_idx, max(soft_cutoff, 1), args.soft_tau_start, args.soft_tau_end) if use_soft else None
+        if args.metric_gated_hardening:
+            use_soft = not args.no_soft_relax
+            soft_tau = soft_tau_state if use_soft else None
+        else:
+            soft_cutoff = int(args.updates * args.soft_relax_frac)
+            use_soft = (not args.no_soft_relax) and update_idx < soft_cutoff
+            soft_tau = soft_tau_at(update_idx, max(soft_cutoff, 1), args.soft_tau_start, args.soft_tau_end) if use_soft else None
 
         transitions = []
         episode_infos = []
@@ -149,6 +172,10 @@ def worker(local_rank, world_size, args):
         local_retained_pairs = sum(info["retained_pairs"] for info in episode_infos) / len(episode_infos)
         local_stop_rate = sum(1.0 if info["stop"] else 0.0 for info in episode_infos) / len(episode_infos)
         local_residual_norm = sum(info["residual_norm"] for info in episode_infos) / len(episode_infos)
+        local_dual_clamp = sum(info.get("dual_clamp_fraction", 0.0) for info in episode_infos) / len(episode_infos)
+        local_overlap_delta = sum(info.get("overlap_delta", 0.0) for info in episode_infos) / len(episode_infos)
+        local_branch_penalty = sum(info.get("branch_violation_penalty", 0.0) for info in episode_infos) / len(episode_infos)
+        local_missed_penalty = sum(info.get("missed_pair_penalty", 0.0) for info in episode_infos) / len(episode_infos)
         avg_overlap = reduce_mean(local_overlap, device)
         avg_wl = reduce_mean(local_wl, device)
         avg_reward = reduce_mean(local_reward, device)
@@ -175,10 +202,31 @@ def worker(local_rank, world_size, args):
         avg_retained_pairs = reduce_mean(local_retained_pairs, device)
         stop_rate = reduce_mean(local_stop_rate, device)
         avg_residual_norm = reduce_mean(local_residual_norm, device)
+        avg_dual_clamp = reduce_mean(local_dual_clamp, device)
+        avg_overlap_delta = reduce_mean(local_overlap_delta, device)
+        avg_branch_penalty = reduce_mean(local_branch_penalty, device)
+        avg_missed_penalty = reduce_mean(local_missed_penalty, device)
 
         for key, value in list(metrics.items()):
             if key != "updates":
                 metrics[key] = reduce_mean(value, device)
+
+        if args.metric_gated_hardening:
+            soft_tau_state = update_metric_gated_tau(
+                soft_tau_state,
+                avg_overlap,
+                avg_branch_violation,
+                avg_missed_pairs,
+                hardening_state,
+                tau_min=args.soft_tau_end,
+                tau_max=args.tau_max,
+                gamma_down=args.tau_down,
+                gamma_up=args.tau_up,
+                overlap_epsilon=args.hardening_overlap_eps,
+                branch_violation_max=args.hardening_branch_vmax,
+                missed_pairs_max=args.hardening_missed_max,
+                patience=args.hardening_patience,
+            )
 
         if local_rank == 0:
             record = {
@@ -220,17 +268,50 @@ def worker(local_rank, world_size, args):
                 "avg_retained_pairs": avg_retained_pairs,
                 "stop_rate": stop_rate,
                 "avg_residual_norm": avg_residual_norm,
+                "avg_dual_clamp_fraction": avg_dual_clamp,
+                "avg_overlap_delta": avg_overlap_delta,
+                "avg_branch_violation_penalty": avg_branch_penalty,
+                "avg_missed_pair_penalty": avg_missed_penalty,
                 "elapsed": time.time() - started,
                 **metrics,
             }
+            validation = None
+            if args.validation_interval > 0 and update_idx % args.validation_interval == 0:
+                validation = validate_policy(
+                    policy,
+                    sizes,
+                    env_config,
+                    device,
+                    args.seed + 1_000_000 + update_idx * 1000,
+                    temperature,
+                    soft_tau=soft_tau,
+                    relaxation=args.relaxation,
+                    episodes=args.validation_episodes,
+                )
+                record.update(validation)
+            if args.metric_gated_hardening:
+                record["next_soft_tau"] = soft_tau_state
+                record["hardening_best_overlap"] = hardening_state["best_overlap"]
+                record["hardening_bad_windows"] = hardening_state["bad_windows"]
             with open(log_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
             print(json.dumps(record, sort_keys=True), flush=True)
 
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_latest.pt", config=vars(args), stats=record)
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_reward.pt", config=vars(args), stats=record)
+            if validation and (validation["validation_overlap"], validation["validation_wirelength"]) < (
+                best_validation_overlap,
+                best_validation_wl,
+            ):
+                best_validation_overlap = validation["validation_overlap"]
+                best_validation_wl = validation["validation_wirelength"]
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_validation.pt", config=vars(args), stats=record)
             if (avg_overlap, avg_wl) < (best_overlap, best_wl):
                 best_overlap, best_wl = avg_overlap, avg_wl
                 save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy.pt", config=vars(args), stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_overlap.pt", config=vars(args), stats=record)
 
     dist.destroy_process_group()
 
@@ -254,6 +335,28 @@ def main():
     parser.add_argument("--soft-relax-frac", type=float, default=0.40)
     parser.add_argument("--soft-tau-start", type=float, default=2.0)
     parser.add_argument("--soft-tau-end", type=float, default=0.10)
+    parser.add_argument("--metric-gated-hardening", action="store_true")
+    parser.add_argument("--tau-max", type=float, default=2.5)
+    parser.add_argument("--tau-down", type=float, default=0.96)
+    parser.add_argument("--tau-up", type=float, default=1.08)
+    parser.add_argument("--hardening-patience", type=int, default=5)
+    parser.add_argument("--hardening-overlap-eps", type=float, default=0.005)
+    parser.add_argument("--hardening-branch-vmax", type=float, default=0.01)
+    parser.add_argument("--hardening-missed-max", type=float, default=64.0)
+    parser.add_argument("--validation-interval", type=int, default=25)
+    parser.add_argument("--validation-episodes", type=int, default=4)
+    parser.add_argument("--resume-checkpoint", default="")
+    parser.add_argument("--reward-mode", choices=["aligned", "legacy"], default="aligned")
+    parser.add_argument("--lag-reward-coef", type=float, default=1.0)
+    parser.add_argument("--overlap-reward-coef", type=float, default=4.0)
+    parser.add_argument("--overlap-regression-coef", type=float, default=16.0)
+    parser.add_argument("--wirelength-reward-coef", type=float, default=0.20)
+    parser.add_argument("--branch-violation-penalty", type=float, default=4.0)
+    parser.add_argument("--missed-pair-penalty", type=float, default=0.02)
+    parser.add_argument("--stop-gate-penalty", type=float, default=5.0)
+    parser.add_argument("--stop-gate-overlap", type=float, default=0.02)
+    parser.add_argument("--stop-no-progress-penalty", type=float, default=4.0)
+    parser.add_argument("--soft-branch-epsilon", type=float, default=1e-4)
     parser.add_argument("--no-soft-relax", action="store_true")
     parser.add_argument("--no-residual-flow", action="store_true")
     parser.add_argument("--no-phr-layer", action="store_true")
