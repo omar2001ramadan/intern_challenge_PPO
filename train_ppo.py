@@ -496,28 +496,32 @@ def main():
                 episodes=args.validation_episodes,
             )
             record.update(validation)
-        gate_overlap = record.get("validation_overlap", avg_overlap)
-        gate_branch = record.get("validation_branch_violation", avg_branch_violation)
-        gate_missed = record.get("validation_missed_pairs", avg_missed_pairs)
         if args.metric_gated_hardening:
-            soft_tau_state = update_metric_gated_tau(
-                soft_tau_state,
-                gate_overlap,
-                gate_branch,
-                gate_missed,
-                hardening_state,
-                tau_min=args.soft_tau_end,
-                tau_max=args.tau_max,
-                gamma_down=args.tau_down,
-                gamma_up=args.tau_up,
-                overlap_epsilon=args.hardening_overlap_eps,
-                branch_violation_max=args.hardening_branch_vmax,
-                missed_pairs_max=args.hardening_missed_max,
-                patience=args.hardening_patience,
-            )
+            hardening_source = "hold"
+            if validation is not None or args.validation_interval <= 0:
+                gate_overlap = record.get("validation_overlap", avg_overlap)
+                gate_branch = record.get("validation_branch_violation", avg_branch_violation)
+                gate_missed = record.get("validation_missed_pairs", avg_missed_pairs)
+                hardening_source = "validation" if validation is not None else "training_fallback"
+                soft_tau_state = update_metric_gated_tau(
+                    soft_tau_state,
+                    gate_overlap,
+                    gate_branch,
+                    gate_missed,
+                    hardening_state,
+                    tau_min=args.soft_tau_end,
+                    tau_max=args.tau_max,
+                    gamma_down=args.tau_down,
+                    gamma_up=args.tau_up,
+                    overlap_epsilon=args.hardening_overlap_eps,
+                    branch_violation_max=args.hardening_branch_vmax,
+                    missed_pairs_max=args.hardening_missed_max,
+                    patience=args.hardening_patience,
+                )
             record["next_soft_tau"] = soft_tau_state
             record["hardening_best_overlap"] = hardening_state["best_overlap"]
             record["hardening_bad_windows"] = hardening_state["bad_windows"]
+            record["hardening_source"] = hardening_source
         record["checkpoint_metric_source"] = "validation" if validation else "training"
         record["checkpoint_metric_overlap"] = record.get("validation_overlap", avg_overlap)
         record["checkpoint_metric_wirelength"] = record.get("validation_wirelength", avg_wl)
