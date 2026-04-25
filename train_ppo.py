@@ -145,12 +145,24 @@ def collect_episode(
         "density_pressure": infos[-1].get("density_pressure", 0.0) if infos else 0.0,
         "boundary_pressure": infos[-1].get("boundary_pressure", 0.0) if infos else 0.0,
         "missed_pairs": infos[-1].get("missed_pairs", 0) if infos else 0,
+        "inactive_missed_pairs": infos[-1].get("inactive_missed_pairs", 0) if infos else 0,
+        "exact_overlap_pairs": infos[-1].get("exact_overlap_pairs", 0) if infos else 0,
         "sampled_pairs": infos[-1].get("sampled_pairs", 0) if infos else 0,
         "cluster_pairs": infos[-1].get("cluster_pairs", 0) if infos else 0,
         "uncertain_pairs": infos[-1].get("uncertain_pairs", 0) if infos else 0,
         "new_active_pairs": infos[-1].get("new_active_pairs", 0) if infos else 0,
         "retained_pairs": infos[-1].get("retained_pairs", 0) if infos else 0,
+        "hard_pair_age_mean": infos[-1].get("hard_pair_age_mean", 0.0) if infos else 0.0,
+        "hard_pair_age_max": infos[-1].get("hard_pair_age_max", 0.0) if infos else 0.0,
+        "hard_pair_age_min": infos[-1].get("hard_pair_age_min", 0.0) if infos else 0.0,
+        "audit_pressure_scale": infos[-1].get("audit_pressure_scale", 1.0) if infos else 1.0,
+        "retention_horizon": infos[-1].get("retention_horizon", 0) if infos else 0,
         "stop": infos[-1].get("stop", False) if infos else False,
+        "stop_probability": infos[-1].get("stop_probability", 0.0) if infos else 0.0,
+        "stop_logit_bias": infos[-1].get("stop_logit_bias", 0.0) if infos else 0.0,
+        "stop_gated": infos[-1].get("stop_gated", False) if infos else False,
+        "stop_overlap": infos[-1].get("stop_overlap", 0.0) if infos else 0.0,
+        "false_stop": infos[-1].get("false_stop", False) if infos else False,
         "residual_norm": infos[-1].get("residual_norm", 0.0) if infos else 0.0,
         "dual_clamp_fraction": infos[-1].get("dual_clamp_fraction", 0.0) if infos else 0.0,
         "overlap_delta": infos[-1].get("overlap_delta", 0.0) if infos else 0.0,
@@ -188,6 +200,13 @@ def validate_policy(policy, sizes, env_config, device, seed, temperature, soft_t
         "validation_wirelength": mean("best_wl"),
         "validation_branch_violation": mean("branch_violation"),
         "validation_missed_pairs": mean("missed_pairs"),
+        "validation_exact_overlap_pairs": mean("exact_overlap_pairs"),
+        "validation_hard_pair_age_mean": mean("hard_pair_age_mean"),
+        "validation_audit_pressure_scale": mean("audit_pressure_scale"),
+        "validation_stop_probability": mean("stop_probability"),
+        "validation_stop_gated_rate": mean("stop_gated"),
+        "validation_stop_overlap": mean("stop_overlap"),
+        "validation_false_stop_rate": mean("false_stop"),
         "validation_stop_rate": sum(1.0 if row.get("stop", False) else 0.0 for row in rows) / max(len(rows), 1),
     }
 
@@ -265,6 +284,10 @@ def main():
     parser.add_argument("--stop-gate-overlap", type=float, default=0.02)
     parser.add_argument("--stop-no-progress-penalty", type=float, default=4.0)
     parser.add_argument("--soft-branch-epsilon", type=float, default=1e-4)
+    parser.add_argument("--audit-missed-target", type=float, default=64.0)
+    parser.add_argument("--audit-pressure-gamma", type=float, default=1.0)
+    parser.add_argument("--audit-pressure-max", type=float, default=4.0)
+    parser.add_argument("--wire-overlap-threshold", type=float, default=0.05)
     parser.add_argument("--no-soft-relax", action="store_true")
     parser.add_argument("--no-residual-flow", action="store_true")
     parser.add_argument("--no-phr-layer", action="store_true")
@@ -309,6 +332,9 @@ def main():
         stop_gate_overlap_threshold=args.stop_gate_overlap,
         stop_no_progress_penalty=args.stop_no_progress_penalty,
         soft_branch_epsilon=args.soft_branch_epsilon,
+        audit_missed_target=args.audit_missed_target,
+        audit_pressure_gamma=args.audit_pressure_gamma,
+        audit_pressure_max=args.audit_pressure_max,
     )
     if args.resume_checkpoint:
         policy, _checkpoint = load_policy_checkpoint(args.resume_checkpoint, device)
@@ -326,10 +352,10 @@ def main():
     log_path = Path(args.log)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    best_overlap = float("inf")
-    best_wl = float("inf")
-    best_validation_overlap = float("inf")
-    best_validation_wl = float("inf")
+    best_exact_overlap = float("inf")
+    best_lex_overlap = float("inf")
+    best_lex_wl = float("inf")
+    best_wire_under_threshold = float("inf")
     best_reward = -float("inf")
     hardening_state = {"best_overlap": float("inf"), "bad_windows": 0}
     soft_tau_state = float(args.soft_tau_start)
@@ -389,12 +415,22 @@ def main():
         avg_density_pressure = sum(info["density_pressure"] for info in episode_infos) / len(episode_infos)
         avg_boundary_pressure = sum(info["boundary_pressure"] for info in episode_infos) / len(episode_infos)
         avg_missed_pairs = sum(info["missed_pairs"] for info in episode_infos) / len(episode_infos)
+        avg_exact_overlap_pairs = sum(info.get("exact_overlap_pairs", 0) for info in episode_infos) / len(episode_infos)
         avg_sampled_pairs = sum(info["sampled_pairs"] for info in episode_infos) / len(episode_infos)
         avg_cluster_pairs = sum(info["cluster_pairs"] for info in episode_infos) / len(episode_infos)
         avg_uncertain_pairs = sum(info["uncertain_pairs"] for info in episode_infos) / len(episode_infos)
         avg_new_active_pairs = sum(info["new_active_pairs"] for info in episode_infos) / len(episode_infos)
         avg_retained_pairs = sum(info["retained_pairs"] for info in episode_infos) / len(episode_infos)
+        avg_hard_pair_age_mean = sum(info.get("hard_pair_age_mean", 0.0) for info in episode_infos) / len(episode_infos)
+        avg_hard_pair_age_max = sum(info.get("hard_pair_age_max", 0.0) for info in episode_infos) / len(episode_infos)
+        avg_hard_pair_age_min = sum(info.get("hard_pair_age_min", 0.0) for info in episode_infos) / len(episode_infos)
+        avg_audit_pressure_scale = sum(info.get("audit_pressure_scale", 1.0) for info in episode_infos) / len(episode_infos)
+        avg_retention_horizon = sum(info.get("retention_horizon", 0.0) for info in episode_infos) / len(episode_infos)
         stop_rate = sum(1.0 if info["stop"] else 0.0 for info in episode_infos) / len(episode_infos)
+        avg_stop_probability = sum(info.get("stop_probability", 0.0) for info in episode_infos) / len(episode_infos)
+        stop_gated_rate = sum(1.0 if info.get("stop_gated", False) else 0.0 for info in episode_infos) / len(episode_infos)
+        false_stop_rate = sum(1.0 if info.get("false_stop", False) else 0.0 for info in episode_infos) / len(episode_infos)
+        avg_stop_overlap = sum(info.get("stop_overlap", 0.0) for info in episode_infos) / len(episode_infos)
         avg_residual_norm = sum(info["residual_norm"] for info in episode_infos) / len(episode_infos)
         record = {
             "update": update_idx,
@@ -426,12 +462,22 @@ def main():
             "avg_density_pressure": avg_density_pressure,
             "avg_boundary_pressure": avg_boundary_pressure,
             "avg_missed_pairs": avg_missed_pairs,
+            "avg_exact_overlap_pairs": avg_exact_overlap_pairs,
             "avg_sampled_pairs": avg_sampled_pairs,
             "avg_cluster_pairs": avg_cluster_pairs,
             "avg_uncertain_pairs": avg_uncertain_pairs,
             "avg_new_active_pairs": avg_new_active_pairs,
             "avg_retained_pairs": avg_retained_pairs,
+            "avg_hard_pair_age_mean": avg_hard_pair_age_mean,
+            "avg_hard_pair_age_max": avg_hard_pair_age_max,
+            "avg_hard_pair_age_min": avg_hard_pair_age_min,
+            "avg_audit_pressure_scale": avg_audit_pressure_scale,
+            "avg_retention_horizon": avg_retention_horizon,
             "stop_rate": stop_rate,
+            "avg_stop_probability": avg_stop_probability,
+            "stop_gated_rate": stop_gated_rate,
+            "false_stop_rate": false_stop_rate,
+            "avg_stop_overlap": avg_stop_overlap,
             "avg_residual_norm": avg_residual_norm,
             "elapsed": time.time() - started,
             **metrics,
@@ -472,26 +518,35 @@ def main():
             record["next_soft_tau"] = soft_tau_state
             record["hardening_best_overlap"] = hardening_state["best_overlap"]
             record["hardening_bad_windows"] = hardening_state["bad_windows"]
+        record["checkpoint_metric_source"] = "validation" if validation else "training"
+        record["checkpoint_metric_overlap"] = record.get("validation_overlap", avg_overlap)
+        record["checkpoint_metric_wirelength"] = record.get("validation_wirelength", avg_wl)
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
         print(json.dumps(record, sort_keys=True), flush=True)
 
-        latest_path = checkpoint_dir / "ordering_policy_latest.pt"
+        metric_overlap = record["checkpoint_metric_overlap"]
+        metric_wl = record["checkpoint_metric_wirelength"]
+
+        latest_path = checkpoint_dir / "latest.pt"
         save_policy_checkpoint(policy, latest_path, config=vars(args), stats=record)
+        save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_latest.pt", config=vars(args), stats=record)
         if avg_reward > best_reward:
             best_reward = avg_reward
+            save_policy_checkpoint(policy, checkpoint_dir / "shaped_reward_debug.pt", config=vars(args), stats=record)
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_reward.pt", config=vars(args), stats=record)
-        if validation and (validation["validation_overlap"], validation["validation_wirelength"]) < (
-            best_validation_overlap,
-            best_validation_wl,
-        ):
-            best_validation_overlap = validation["validation_overlap"]
-            best_validation_wl = validation["validation_wirelength"]
-            save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_validation.pt", config=vars(args), stats=record)
-        if (avg_overlap, avg_wl) < (best_overlap, best_wl):
-            best_overlap, best_wl = avg_overlap, avg_wl
-            save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy.pt", config=vars(args), stats=record)
+        if metric_overlap < best_exact_overlap:
+            best_exact_overlap = metric_overlap
+            save_policy_checkpoint(policy, checkpoint_dir / "best_exact_overlap.pt", config=vars(args), stats=record)
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_overlap.pt", config=vars(args), stats=record)
+        if (metric_overlap, metric_wl) < (best_lex_overlap, best_lex_wl):
+            best_lex_overlap, best_lex_wl = metric_overlap, metric_wl
+            save_policy_checkpoint(policy, checkpoint_dir / "best_lexicographic.pt", config=vars(args), stats=record)
+            save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_validation.pt", config=vars(args), stats=record)
+            save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy.pt", config=vars(args), stats=record)
+        if metric_overlap <= args.wire_overlap_threshold and metric_wl < best_wire_under_threshold:
+            best_wire_under_threshold = metric_wl
+            save_policy_checkpoint(policy, checkpoint_dir / "best_wire_given_overlap_threshold.pt", config=vars(args), stats=record)
 
 
 if __name__ == "__main__":

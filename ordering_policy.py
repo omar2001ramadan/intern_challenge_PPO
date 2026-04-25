@@ -51,6 +51,8 @@ class PlacementPolicyAction:
     control_raw: torch.Tensor
     k_index: torch.Tensor
     stop: torch.Tensor
+    stop_probability: torch.Tensor
+    stop_logit_bias: torch.Tensor
     cluster_ids: torch.Tensor
     dag_axis: torch.Tensor
     pair_branch_choices: torch.Tensor
@@ -798,14 +800,16 @@ class OrderingPolicy(nn.Module):
         else:
             k_index = torch.distributions.Categorical(logits=k_logits).sample()
 
-        stop_logits = self.stop_head(context).squeeze(-1) + graph.get(
+        stop_logit_bias = graph.get(
             "stop_logit_bias",
             torch.zeros((), dtype=h.dtype, device=h.device),
         ).to(dtype=h.dtype, device=h.device)
+        stop_logits = self.stop_head(context).squeeze(-1) + stop_logit_bias
+        stop_probability = torch.sigmoid(stop_logits)
         if deterministic:
-            stop = (torch.sigmoid(stop_logits) > 0.5).to(dtype=h.dtype)
+            stop = (stop_probability > 0.5).to(dtype=h.dtype)
         else:
-            stop = torch.bernoulli(torch.sigmoid(stop_logits)).to(dtype=h.dtype)
+            stop = torch.bernoulli(stop_probability).to(dtype=h.dtype)
 
         cluster_logits = self.cluster_head(h)
         std_mask = self._standard_cell_mask(graph)
@@ -880,6 +884,8 @@ class OrderingPolicy(nn.Module):
             control_raw=control_raw,
             k_index=k_index,
             stop=stop,
+            stop_probability=stop_probability,
+            stop_logit_bias=stop_logit_bias,
             cluster_ids=cluster_ids,
             dag_axis=dag_axis,
             pair_branch_choices=pair_branch_choices,

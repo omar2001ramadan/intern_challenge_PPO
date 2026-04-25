@@ -1,5 +1,6 @@
 """CMDP environment for ordering PPO placement."""
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -61,6 +62,9 @@ class EnvConfig:
     rho_min: float = 0.05
     rho_max: float = 128.0
     dual_max: float = 10_000.0
+    audit_missed_target: float = 64.0
+    audit_pressure_gamma: float = 1.0
+    audit_pressure_max: float = 4.0
     repair_candidates: bool = False
     enable_residual_flow: bool = True
     enable_phr_layer: bool = True
@@ -291,9 +295,18 @@ class PlacementOrderingEnv:
             )
         audit_info = {
             "missed_pairs": 0,
+            "inactive_missed_pairs": 0,
+            "exact_overlap_pairs": 0,
             "sampled_pairs": 0,
+            "cluster_pairs": 0,
+            "uncertain_pairs": 0,
             "new_active_pairs": 0,
             "retained_pairs": int(self.active_pairs.shape[0]),
+            "hard_pair_age_mean": self._age_mean(self.active_pair_ages),
+            "hard_pair_age_max": self._age_max(self.active_pair_ages),
+            "hard_pair_age_min": self._age_min(self.active_pair_ages),
+            "audit_pressure_scale": 1.0,
+            "retention_horizon": int(self.config.active_pair_retention),
         }
         if self.config.enable_exact_audit:
             audit_info = self._audit_active_set(
@@ -315,6 +328,10 @@ class PlacementOrderingEnv:
 
         self.step_index += 1
         stopped = bool(action.stop.detach().item() >= 0.5)
+        stop_probability = float(getattr(action, "stop_probability", action.stop).detach().item())
+        stop_logit_bias = float(getattr(action, "stop_logit_bias", action.stop.new_zeros(())).detach().item())
+        stop_overlap = score["overlap_ratio"] if stopped else 0.0
+        false_stop = bool(stopped and score["overlap_ratio"] > 0.0)
         done = stopped or self.step_index >= self.config.horizon
         if stopped:
             reward += self._stop_reward(score, before_score)
@@ -341,6 +358,11 @@ class PlacementOrderingEnv:
             "pair_emphasis": float(action.pair_emphasis.detach().item()),
             "tau": active_soft_tau,
             "stop": stopped,
+            "stop_probability": stop_probability,
+            "stop_logit_bias": stop_logit_bias,
+            "stop_gated": stop_logit_bias < 0.0,
+            "stop_overlap": stop_overlap,
+            "false_stop": false_stop,
             "residual_norm": float(residual.norm(dim=1).mean().detach().item()),
             **reward_terms,
             "movement_penalty": movement_penalty,
@@ -872,10 +894,18 @@ class PlacementOrderingEnv:
 
     def _audit_active_set(self, action=None, cluster_ids=None, pair_emphasis=0.0):
         current = write_positions(self.cell_features, self.centers)
-        missed_pairs = exact_overlap_pairs(current)
-        exact_missed_count = int(missed_pairs.shape[0])
-        cluster_pairs = self._sample_cluster_pairs(cluster_ids, pair_emphasis)
-        uncertain_pairs = self._sample_uncertain_pairs(action, pair_emphasis)
+        exact_pairs = canonicalize_pairs(exact_overlap_pairs(current))
+        exact_overlap_count = int(exact_pairs.shape[0])
+        inactive_exact_pairs = self._inactive_exact_pairs(exact_pairs)
+        inactive_missed_count = int(inactive_exact_pairs.shape[0])
+        audit_pressure_scale = self._audit_pressure_scale(inactive_missed_count)
+        scaled_pair_emphasis = max(0.0, min(float(pair_emphasis) * audit_pressure_scale, 1.0))
+        retention_horizon = max(
+            int(self.config.active_pair_retention),
+            int(math.ceil(float(self.config.active_pair_retention) * audit_pressure_scale)),
+        )
+        cluster_pairs = self._sample_cluster_pairs(cluster_ids, scaled_pair_emphasis)
+        uncertain_pairs = self._sample_uncertain_pairs(action, scaled_pair_emphasis)
         sampled_chunks = [pairs for pairs in (cluster_pairs, uncertain_pairs) if pairs.numel() > 0]
         sampled_pairs = (
             canonicalize_pairs(torch.cat(sampled_chunks, dim=0))
@@ -883,22 +913,30 @@ class PlacementOrderingEnv:
             else torch.empty((0, 2), dtype=torch.long, device=self.centers.device)
         )
         old_count = int(self.active_pairs.shape[0])
+        candidate_pairs = exact_pairs
         if sampled_pairs.numel() > 0:
-            missed_pairs = torch.cat([missed_pairs, sampled_pairs], dim=0) if missed_pairs.numel() > 0 else sampled_pairs
+            candidate_pairs = torch.cat([candidate_pairs, sampled_pairs], dim=0) if candidate_pairs.numel() > 0 else sampled_pairs
         updated, updated_ages = update_active_pair_cache(
             self.active_pairs,
             self.active_pair_ages,
-            missed_pairs,
-            retention_horizon=self.config.active_pair_retention,
+            candidate_pairs,
+            retention_horizon=retention_horizon,
             max_pairs=self.config.active_pair_limit,
         )
         info = {
-            "missed_pairs": exact_missed_count,
+            "missed_pairs": inactive_missed_count,
+            "inactive_missed_pairs": inactive_missed_count,
+            "exact_overlap_pairs": exact_overlap_count,
             "sampled_pairs": int(sampled_pairs.shape[0]),
             "cluster_pairs": int(cluster_pairs.shape[0]),
             "uncertain_pairs": int(uncertain_pairs.shape[0]),
             "new_active_pairs": max(int(updated.shape[0]) - old_count, 0),
             "retained_pairs": int((updated_ages > 0).sum().item()) if updated_ages.numel() else 0,
+            "hard_pair_age_mean": self._age_mean(updated_ages),
+            "hard_pair_age_max": self._age_max(updated_ages),
+            "hard_pair_age_min": self._age_min(updated_ages),
+            "audit_pressure_scale": audit_pressure_scale,
+            "retention_horizon": retention_horizon,
         }
         if updated.shape[0] == self.active_pairs.shape[0] and torch.equal(updated, self.active_pairs):
             self.active_pair_ages = updated_ages
@@ -907,6 +945,45 @@ class PlacementOrderingEnv:
         self.active_pairs = updated
         self.active_pair_ages = updated_ages
         return info
+
+    def _inactive_exact_pairs(self, exact_pairs):
+        exact_pairs = canonicalize_pairs(exact_pairs)
+        if exact_pairs.numel() == 0 or self.active_pairs.numel() == 0:
+            return exact_pairs
+        active_pairs = canonicalize_pairs(self.active_pairs)
+        if active_pairs.numel() == 0:
+            return exact_pairs
+        n = int(self.cell_features.shape[0])
+        exact_keys = exact_pairs[:, 0] * n + exact_pairs[:, 1]
+        active_keys = active_pairs[:, 0] * n + active_pairs[:, 1]
+        if hasattr(torch, "isin"):
+            inactive_mask = ~torch.isin(exact_keys, active_keys)
+            return exact_pairs[inactive_mask]
+        active_set = set(active_keys.detach().cpu().tolist())
+        keep = [int(key) not in active_set for key in exact_keys.detach().cpu().tolist()]
+        if not any(keep):
+            return exact_pairs.new_empty((0, 2))
+        return exact_pairs[torch.tensor(keep, dtype=torch.bool, device=exact_pairs.device)]
+
+    def _audit_pressure_scale(self, inactive_missed_count):
+        target = float(self.config.audit_missed_target)
+        if target <= 0.0:
+            return 1.0
+        excess = max((float(inactive_missed_count) - target) / (target + 1e-6), 0.0)
+        scale = 1.0 + float(self.config.audit_pressure_gamma) * excess
+        return max(1.0, min(scale, float(self.config.audit_pressure_max)))
+
+    @staticmethod
+    def _age_mean(ages):
+        return float(ages.float().mean().item()) if ages is not None and ages.numel() else 0.0
+
+    @staticmethod
+    def _age_max(ages):
+        return float(ages.max().item()) if ages is not None and ages.numel() else 0.0
+
+    @staticmethod
+    def _age_min(ages):
+        return float(ages.min().item()) if ages is not None and ages.numel() else 0.0
 
     def _sample_uncertain_pairs(self, action=None, pair_emphasis=0.0):
         if action is None:
