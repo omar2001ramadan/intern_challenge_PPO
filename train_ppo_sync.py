@@ -66,7 +66,6 @@ def worker(local_rank, world_size, args):
         ordering_representation=args.ordering_representation,
         branch_mode=args.branch_mode,
         al_mode=args.al_mode,
-        reward_mode=args.reward_mode,
         lag_reward_coef=args.lag_reward_coef,
         exact_overlap_reward_coef=args.overlap_reward_coef,
         exact_overlap_regression_coef=args.overlap_regression_coef,
@@ -307,11 +306,11 @@ def worker(local_rank, world_size, args):
                 record.update(validation)
             if args.metric_gated_hardening:
                 hardening_source = "hold"
-                if validation is not None or args.validation_interval <= 0:
-                    gate_overlap = record.get("validation_overlap", avg_overlap)
-                    gate_branch = record.get("validation_branch_violation", avg_branch_violation)
-                    gate_missed = record.get("validation_missed_pairs", avg_missed_pairs)
-                    hardening_source = "validation" if validation is not None else "training_fallback"
+                if validation is not None:
+                    gate_overlap = record["validation_overlap"]
+                    gate_branch = record["validation_branch_violation"]
+                    gate_missed = record["validation_missed_pairs"]
+                    hardening_source = "validation"
                     soft_tau_state = update_metric_gated_tau(
                         soft_tau_state,
                         gate_overlap,
@@ -331,12 +330,10 @@ def worker(local_rank, world_size, args):
                 record["hardening_best_overlap"] = hardening_state["best_overlap"]
                 record["hardening_bad_windows"] = hardening_state["bad_windows"]
                 record["hardening_source"] = hardening_source
-            authority_metrics_available = validation is not None or args.validation_interval <= 0
-            record["checkpoint_metric_source"] = (
-                "validation" if validation else ("training_fallback" if args.validation_interval <= 0 else "held")
-            )
-            record["checkpoint_metric_overlap"] = record.get("validation_overlap", avg_overlap)
-            record["checkpoint_metric_wirelength"] = record.get("validation_wirelength", avg_wl)
+            authority_metrics_available = validation is not None
+            record["checkpoint_metric_source"] = "validation" if validation else "held"
+            record["checkpoint_metric_overlap"] = record.get("validation_overlap")
+            record["checkpoint_metric_wirelength"] = record.get("validation_wirelength")
             with open(log_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
             print(json.dumps(record, sort_keys=True), flush=True)
@@ -411,7 +408,6 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=25)
     parser.add_argument("--validation-episodes", type=int, default=4)
     parser.add_argument("--resume-checkpoint", default="")
-    parser.add_argument("--reward-mode", choices=["aligned", "legacy"], default="aligned")
     parser.add_argument("--lag-reward-coef", type=float, default=1.0)
     parser.add_argument("--overlap-reward-coef", type=float, default=4.0)
     parser.add_argument("--overlap-regression-coef", type=float, default=16.0)

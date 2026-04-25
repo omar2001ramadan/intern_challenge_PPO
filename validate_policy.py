@@ -1,4 +1,4 @@
-"""Policy-only validation against deterministic sequence-pair baselines."""
+"""Policy validation through declared environment transitions."""
 
 import argparse
 import json
@@ -6,12 +6,9 @@ from pathlib import Path
 
 import torch
 
-from active_set import build_initial_active_pairs
-from env import write_positions
-from induce_branches import sequence_pair_from_centers
-from ordering_policy import OrderingPolicy, build_graph_state, load_policy_checkpoint
+from env import EnvConfig, PlacementOrderingEnv, write_positions
+from ordering_policy import load_policy_checkpoint
 from placement import calculate_normalized_metrics, generate_placement_input
-from primal_dual import sequence_pair_legalize
 from test import TEST_CASES
 
 
@@ -48,52 +45,65 @@ def make_case(case, device):
     return test_id, cell_features.to(device), pin_features.to(device), edge_list.to(device)
 
 
-def score_sequence_pair(cell_features, pin_features, edge_list, seq_plus, seq_minus):
-    centers = sequence_pair_legalize(
-        cell_features,
-        seq_plus,
-        seq_minus,
-        reference_centers=cell_features[:, 2:4],
+def score_current(cell_features, pin_features, edge_list):
+    metrics = calculate_normalized_metrics(
+        cell_features.detach().cpu(),
+        pin_features.detach().cpu(),
+        edge_list.detach().cpu(),
     )
-    placed = write_positions(cell_features, centers)
-    metrics = calculate_normalized_metrics(placed.detach().cpu(), pin_features.detach().cpu(), edge_list.detach().cpu())
     return metrics
 
 
 def geometry_result(cell_features, pin_features, edge_list):
-    seq_plus, seq_minus = sequence_pair_from_centers(cell_features)
-    return score_sequence_pair(cell_features, pin_features, edge_list, seq_plus, seq_minus)
+    metrics = score_current(cell_features, pin_features, edge_list)
+    metrics["source"] = "input_noop"
+    return metrics
 
 
-def policy_result(policy, cell_features, pin_features, edge_list, samples=1, temperature=0.7):
-    active_pairs = build_initial_active_pairs(cell_features)
-    branch_duals = torch.zeros((active_pairs.shape[0], 4), dtype=cell_features.dtype, device=cell_features.device)
-    boundary_duals = torch.zeros((cell_features.shape[0], 4), dtype=cell_features.dtype, device=cell_features.device)
-    graph = build_graph_state(cell_features, pin_features, edge_list, active_pairs, branch_duals, boundary_duals)
-
+def policy_result(policy, cell_features, pin_features, edge_list, samples=1, temperature=0.7, steps=4):
     best = None
-    with torch.no_grad():
-        deterministic_action = policy.deterministic_sequence_pair(graph)
-        candidates = [(deterministic_action.seq_plus, deterministic_action.seq_minus, "deterministic")]
-        for idx in range(max(samples - 1, 0)):
-            action = policy.sample_sequence_pair(graph, temperature=temperature)
-            candidates.append((action.seq_plus, action.seq_minus, f"sample_{idx}"))
-
-    for seq_plus, seq_minus, source in candidates:
-        metrics = score_sequence_pair(cell_features, pin_features, edge_list, seq_plus, seq_minus)
-        metrics["source"] = source
+    for idx in range(max(samples, 1)):
+        config = EnvConfig(horizon=steps, soft_relaxation=False)
+        env = PlacementOrderingEnv(cell_features, pin_features, edge_list, config)
+        memory = policy.initial_memory(cell_features.device)
+        for _ in range(steps):
+            graph = env.graph_state(memory=memory)
+            with torch.no_grad():
+                action = policy.sample_action(
+                    graph,
+                    temperature=temperature,
+                    deterministic=(idx == 0),
+                )
+                memory = action.next_memory.detach()
+            _reward, done, _info = env.step_action(action)
+            if done:
+                break
+        score, centers = env.best_candidate()
+        placed = write_positions(cell_features, centers)
+        metrics = score_current(placed, pin_features, edge_list)
+        metrics["source"] = "deterministic_env" if idx == 0 else f"sample_env_{idx}"
+        metrics["env_overlap_ratio"] = score["overlap_ratio"]
+        metrics["env_normalized_wl"] = score["normalized_wl"]
         key = (metrics["num_cells_with_overlaps"], metrics["overlap_ratio"], metrics["normalized_wl"])
         if best is None or key < best[0]:
             best = (key, metrics)
     return best[1]
 
 
-def evaluate_cases(policy, cases, device, samples=1, temperature=0.7):
+def evaluate_cases(policy, cases, device, samples=1, temperature=0.7, steps=4):
     rows = []
     for case in cases:
         test_id, cell_features, pin_features, edge_list = make_case(case, device)
         baseline = geometry_result(cell_features, pin_features, edge_list)
-        policy_metrics = policy_result(policy, cell_features, pin_features, edge_list, samples=samples, temperature=temperature)
+        policy_metrics = policy_result(
+            policy,
+            cell_features,
+            pin_features,
+            edge_list,
+            samples=samples,
+            temperature=temperature,
+            steps=steps,
+        )
         row = {
             "test_id": test_id,
             "geometry_overlap": baseline["overlap_ratio"],
@@ -126,13 +136,21 @@ def main():
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--cases", default="first10")
     parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device)
     policy, _ = load_policy_checkpoint(args.checkpoint, device)
-    rows = evaluate_cases(policy, parse_cases(args.cases), device, samples=args.samples, temperature=args.temperature)
+    rows = evaluate_cases(
+        policy,
+        parse_cases(args.cases),
+        device,
+        samples=args.samples,
+        temperature=args.temperature,
+        steps=args.steps,
+    )
     result = {"checkpoint": args.checkpoint, "rows": rows, "summary": summarize(rows)}
     text = json.dumps(result, indent=2, sort_keys=True)
     print(text)

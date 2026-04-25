@@ -21,7 +21,7 @@ from constraints import (
 )
 from induce_branches import Branch, induce_branches_from_sequence_pair
 from ordering_policy import build_graph_state, hierarchical_active_branch_weights
-from primal_dual import iterative_overlap_repair, phr_dual_update, phr_inequality_penalty, sequence_pair_legalize
+from primal_dual import phr_dual_update, phr_inequality_penalty
 
 
 @dataclass
@@ -37,7 +37,6 @@ class EnvConfig:
     terminal_feasible_bonus: float = 2.0
     terminal_wirelength_coef: float = 0.25
     active_pair_limit: int = 500_000
-    legalize_limit: int = 6000
     active_pair_retention: int = 4
     density_bins: int = 8
     density_rho_max: float = 0.85
@@ -45,7 +44,6 @@ class EnvConfig:
     soft_tau: float = 1.0
     exact_overlap_reward_coef: float = 1.0
     exact_wirelength_reward_coef: float = 0.20
-    reward_mode: str = "aligned"
     lag_reward_coef: float = 1.0
     exact_overlap_regression_coef: float = 8.0
     exact_wirelength_gate_epsilon: float = 0.002
@@ -65,7 +63,6 @@ class EnvConfig:
     audit_missed_target: float = 64.0
     audit_pressure_gamma: float = 1.0
     audit_pressure_max: float = 4.0
-    repair_candidates: bool = False
     enable_residual_flow: bool = True
     enable_phr_layer: bool = True
     enable_exact_audit: bool = True
@@ -400,13 +397,6 @@ class PlacementOrderingEnv:
         )
         violation_penalty = self.config.branch_violation_penalty_coef * after_logs["branch_violation"]
         missed_pair_penalty = self.config.missed_pair_penalty_coef * float(audit_info.get("missed_pairs", 0))
-        if self.config.reward_mode == "legacy":
-            exact_reward = (
-                self.config.exact_overlap_reward_coef * overlap_delta
-                + self.config.exact_wirelength_reward_coef * wirelength_delta
-            )
-            violation_penalty = 0.0
-            missed_pair_penalty = 0.0
         reward = (
             self.config.lag_reward_coef * lag_delta
             + exact_reward
@@ -1071,18 +1061,6 @@ class PlacementOrderingEnv:
     def _save_candidate(self, centers):
         score = self._score_centers(centers)
         self.saved_candidates.append((score, centers.detach().clone()))
-        if self.config.repair_candidates and score["overlap_cells"] > 0:
-            repaired = iterative_overlap_repair(self.cell_features, centers)
-            repaired_current = write_positions(self.cell_features, repaired)
-            repaired_pairs = exact_overlap_pairs(repaired_current)
-            repaired_ratio, repaired_cells = overlap_ratio_from_pairs(repaired_current.shape[0], repaired_pairs)
-            repaired_score = {
-                "overlap_ratio": repaired_ratio,
-                "overlap_cells": repaired_cells,
-                "num_overlap_pairs": int(repaired_pairs.shape[0]),
-                "normalized_wl": normalized_wirelength(repaired_current, self.pin_features, self.edge_list),
-            }
-            self.saved_candidates.append((repaired_score, repaired.detach().clone()))
         return score
 
     def _score_centers(self, centers):
@@ -1108,13 +1086,3 @@ class PlacementOrderingEnv:
             - no_progress
             - self.config.stop_wirelength_coef * score["normalized_wl"]
         )
-
-    def legalize_candidate(self, seq_plus, seq_minus):
-        legalized = sequence_pair_legalize(
-            write_positions(self.cell_features, self.centers),
-            seq_plus,
-            seq_minus,
-            reference_centers=self.centers,
-            limit=self.config.legalize_limit,
-        )
-        return self._save_candidate(legalized)

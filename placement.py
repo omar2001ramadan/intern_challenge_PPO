@@ -58,7 +58,7 @@ from constraints import (
     overlap_repulsion_for_pairs,
 )
 from induce_branches import branch_antisymmetry_error, induce_branches_from_sequence_pair, sequence_pair_from_centers
-from primal_dual import iterative_overlap_repair, phr_dual_update, phr_inequality_penalty, sequence_pair_legalize
+from primal_dual import phr_dual_update, phr_inequality_penalty
 
 
 # Feature index enums for cleaner code access
@@ -402,11 +402,16 @@ def _policy_checkpoint_path():
     use_policy = os.environ.get("PLACEMENT_USE_POLICY", "1").lower()
     if use_policy in {"0", "false", "no", "off"}:
         return None
-    path = os.environ.get(
-        "PLACEMENT_POLICY_CHECKPOINT",
+    configured = os.environ.get("PLACEMENT_POLICY_CHECKPOINT")
+    candidates = [
+        configured,
+        os.path.join(OUTPUT_DIR, "checkpoints", "ppo_sync_8gpu_validity", "ordering_policy.pt"),
         os.path.join(OUTPUT_DIR, "checkpoints", "ordering_policy.pt"),
-    )
-    return path if os.path.exists(path) else None
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
 
 
 def _wirelength_gradient_value(cell_features, pin_features, edge_list):
@@ -500,7 +505,7 @@ def _policy_conditioned_transition_or_none(
     device,
     verbose=False,
 ):
-    enabled = os.environ.get("PLACEMENT_POLICY_TRANSITION", "0").lower()
+    enabled = os.environ.get("PLACEMENT_POLICY_TRANSITION", "1").lower()
     if enabled not in {"1", "true", "yes", "on"}:
         return None
     checkpoint_path = _policy_checkpoint_path()
@@ -527,7 +532,6 @@ def _policy_conditioned_transition_or_none(
         env_config = EnvConfig(
             horizon=horizon,
             soft_relaxation=soft_relaxation,
-            repair_candidates=False,
             active_pair_limit=int(os.environ.get("PLACEMENT_ACTIVE_PAIR_LIMIT", "500000")),
             density_bins=int(os.environ.get("PLACEMENT_DENSITY_BINS", "8")),
             density_rho_max=float(os.environ.get("PLACEMENT_DENSITY_RHO_MAX", "0.85")),
@@ -799,19 +803,6 @@ def train_placement(
             "loss_history": {"total_loss": [], "wirelength_loss": [], "overlap_loss": []},
         }
 
-    requested_steps = int(os.environ.get("PLACEMENT_PRIMAL_STEPS", str(num_epochs)))
-    lr = float(os.environ.get("PLACEMENT_LR", str(lr)))
-    lambda_wirelength = float(os.environ.get("PLACEMENT_LAMBDA_WIRELENGTH", str(lambda_wirelength)))
-    lambda_overlap = float(os.environ.get("PLACEMENT_LAMBDA_OVERLAP", str(lambda_overlap)))
-    outer_stages = int(os.environ.get("PLACEMENT_OUTER_STAGES", "5"))
-    outer_stages = max(1, outer_stages)
-    steps_per_stage = max(1, requested_steps // outer_stages)
-    rho = float(os.environ.get("PLACEMENT_RHO", "14.0"))
-    legalize_limit = int(os.environ.get("PLACEMENT_LEGALIZE_LIMIT", "6000"))
-    density_bins = int(os.environ.get("PLACEMENT_DENSITY_BINS", "8"))
-    density_rho_max = float(os.environ.get("PLACEMENT_DENSITY_RHO_MAX", "0.85"))
-    active_retention = int(os.environ.get("PLACEMENT_ACTIVE_RETENTION", "4"))
-
     policy_transition_centers = _policy_conditioned_transition_or_none(
         base_cell_features,
         pin_features_device,
@@ -826,166 +817,25 @@ def train_placement(
             "loss_history": {"total_loss": [], "wirelength_loss": [], "overlap_loss": []},
         }
 
-    centers = base_cell_features[:, 2:4].clone()
-    active_pairs = build_initial_active_pairs(base_cell_features, pin_features_device, edge_list_device)
-    active_pair_ages = torch.full(
-        (active_pairs.shape[0],),
-        active_retention,
-        dtype=torch.long,
-        device=device,
-    )
-    branch_duals = torch.zeros((active_pairs.shape[0], 4), dtype=base_cell_features.dtype, device=device)
-    boundary_duals = torch.zeros((n, 4), dtype=base_cell_features.dtype, device=device)
-    density_g, density_assignment = density_bin_constraints(
-        centers,
-        base_cell_features,
-        outline_from_cells(base_cell_features),
-        bins=density_bins,
-        rho_max=density_rho_max,
-    )
-    density_duals = torch.zeros_like(density_g)
-
-    candidates = []
-    loss_history = {
-        "total_loss": [],
-        "wirelength_loss": [],
-        "overlap_loss": [],
-    }
-
-    def save_candidate(candidate_centers):
-        candidate_features = _write_positions(base_cell_features, candidate_centers)
-        score = _score_candidate(candidate_features, pin_features_device, edge_list_device)
-        candidates.append((score, candidate_centers.detach().clone()))
-        return score
-
-    save_candidate(centers)
-
-    for stage in range(outer_stages):
-        stage_features = _write_positions(base_cell_features, centers)
-        density_g, density_assignment = density_bin_constraints(
-            centers,
-            base_cell_features,
-            outline_from_cells(base_cell_features),
-            bins=density_bins,
-            rho_max=density_rho_max,
-        )
-        density_pressure = density_pressure_per_cell(density_g, density_assignment, density_duals)
-        seq_plus, seq_minus, ordering_source = _select_sequence_pair(
-            stage_features,
-            pin_features_device,
-            edge_list_device,
-            active_pairs,
-            branch_duals,
-            boundary_duals,
-            density_duals,
-            density_pressure,
-            device,
-        )
-        anti_error = branch_antisymmetry_error(seq_plus, seq_minus) if verbose and stage == 0 else 0.0
-
-        legalized = sequence_pair_legalize(
-            stage_features,
-            seq_plus,
-            seq_minus,
-            reference_centers=centers,
-            limit=legalize_limit,
-        )
-        legal_score = save_candidate(legalized)
-        centers = legalized
-
-        branches = induce_branches_from_sequence_pair(seq_plus, seq_minus, active_pairs)
-        if verbose:
-            print(f"Stage {stage + 1}/{outer_stages}: active_pairs={active_pairs.shape[0]} ordering={ordering_source}")
-            print(
-                f"  legalized overlap={legal_score['overlap_ratio']:.4f} "
-                f"wl={legal_score['normalized_wl']:.4f} antisym={anti_error:.4g}"
-            )
-
-        centers, branch_duals, boundary_duals, density_duals, stage_history = _primal_dual_coordinate_stage(
-            base_cell_features,
-            pin_features_device,
-            edge_list_device,
-            centers,
-            active_pairs,
-            branches,
-            branch_duals,
-            boundary_duals,
-            density_duals,
-            steps=steps_per_stage,
-            lr=lr,
-            rho=rho,
-            lambda_wirelength=lambda_wirelength,
-            lambda_overlap=lambda_overlap,
-            density_bins=density_bins,
-            density_rho_max=density_rho_max,
-            verbose=verbose and stage == 0,
-        )
-
-        for key in loss_history:
-            loss_history[key].extend(stage_history[key])
-
-        stage_score = save_candidate(centers)
-        if stage_score["overlap_cells"] > 0:
-            repaired_centers = iterative_overlap_repair(base_cell_features, centers)
-            repaired_score = save_candidate(repaired_centers)
-            if _candidate_key((repaired_score, repaired_centers)) < _candidate_key((stage_score, centers)):
-                centers = repaired_centers
-                stage_score = repaired_score
-
-        current_features = _write_positions(base_cell_features, centers)
-        missed_pairs = exact_overlap_pairs(current_features)
-        new_active_pairs, new_active_pair_ages = update_active_pair_cache(
-            active_pairs,
-            active_pair_ages,
-            missed_pairs,
-            retention_horizon=active_retention,
-        )
-        if new_active_pairs.shape[0] != active_pairs.shape[0]:
-            active_pairs = new_active_pairs
-            branch_duals = torch.zeros((active_pairs.shape[0], 4), dtype=base_cell_features.dtype, device=device)
-        active_pair_ages = new_active_pair_ages
-
-        if verbose:
-            print(
-                f"  refined overlap={stage_score['overlap_ratio']:.4f} "
-                f"wl={stage_score['normalized_wl']:.4f} missed_pairs={missed_pairs.shape[0]}"
-            )
-
-        # Sharpen the AL as the ordering hardens.
-        rho *= 1.25
-
-    best_score, best_centers = min(candidates, key=_candidate_key)
-
-    # Final exact legalizing repair if every refined candidate still overlaps.
-    if best_score["overlap_cells"] > 0:
-        seq_plus, seq_minus = sequence_pair_from_centers(_write_positions(base_cell_features, best_centers))
-        repaired = sequence_pair_legalize(
-            _write_positions(base_cell_features, best_centers),
-            seq_plus,
-            seq_minus,
-            reference_centers=best_centers,
-            limit=legalize_limit,
-        )
-        repaired_score = save_candidate(repaired)
-        best_score, best_centers = min(candidates, key=_candidate_key)
-        if verbose:
-            print(
-                f"Final repair overlap={repaired_score['overlap_ratio']:.4f} "
-                f"wl={repaired_score['normalized_wl']:.4f}"
-            )
-
+    best_score = _score_candidate(base_cell_features, pin_features_device, edge_list_device)
     if verbose:
         print(
-            f"Selected candidate: overlap={best_score['overlap_ratio']:.4f} "
-            f"wl={best_score['normalized_wl']:.4f}"
+            "No policy checkpoint configured; returning the declared input candidate "
+            "without any coordinate changes. "
+            f"overlap={best_score['overlap_ratio']:.4f} wl={best_score['normalized_wl']:.4f}"
         )
 
-    final_cell_features = _write_positions(base_cell_features, best_centers).to(input_device)
-
     return {
-        "final_cell_features": final_cell_features,
+        "final_cell_features": base_cell_features.to(input_device),
         "initial_cell_features": initial_cell_features.to(input_device),
-        "loss_history": loss_history,
+        "loss_history": {
+            "total_loss": [],
+            "wirelength_loss": [],
+            "overlap_loss": [],
+            "official_overlap_ratio": [best_score["overlap_ratio"]],
+            "official_normalized_wl": [best_score["normalized_wl"]],
+            "declared_noop": [1.0],
+        },
     }
 
 
