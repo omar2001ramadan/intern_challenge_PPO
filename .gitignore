@@ -5,6 +5,7 @@
 *.bmp
 
 **/__pycache__/**
+.venv/
 
 training_logs*/
 checkpoints*/

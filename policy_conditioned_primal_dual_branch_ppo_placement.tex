@@ -1,0 +1,1545 @@
+\documentclass[11pt]{article}
+
+% ============================================================
+% Ultimate synthesis: policy-owned stochastic placement +
+% policy-conditioned signed primal-dual geometry transition.
+% ============================================================
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.78in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,tabularx,array,longtable,multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{mathrsfs}
+\usepackage{ragged2e}
+\usepackage{needspace}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+
+\definecolor{navy}{RGB}{25,42,70}
+\definecolor{blue}{RGB}{44,104,175}
+\definecolor{green}{RGB}{70,145,90}
+\definecolor{orange}{RGB}{221,137,48}
+\definecolor{red}{RGB}{198,76,76}
+\definecolor{purple}{RGB}{105,76,170}
+\definecolor{graytext}{RGB}{78,82,90}
+\definecolor{linegray}{RGB}{224,228,235}
+\definecolor{panel}{RGB}{247,249,252}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.46em}
+\setlist[itemize]{leftmargin=1.25em,itemsep=0.18em,topsep=0.20em}
+\setlist[enumerate]{leftmargin=1.35em,itemsep=0.18em,topsep=0.20em}
+\renewcommand{\arraystretch}{1.14}
+\emergencystretch=3em
+\sloppy
+\newcolumntype{Y}{>{\RaggedRight\arraybackslash}X}
+
+\titleformat{\section}{\Large\bfseries\color{navy}}{}{0em}{}[\vspace{-0.25em}\color{linegray}\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\color{blue}}{}{0em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\color{purple}}{}{0em}{}
+\titlespacing*{\section}{0pt}{0.60em}{0.40em}
+\titlespacing*{\subsection}{0pt}{0.46em}{0.14em}
+\titlespacing*{\subsubsection}{0pt}{0.35em}{0.10em}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small\color{graytext} Policy-Conditioned Primal-Dual Branch PPO Placement}
+\rhead{\small\color{graytext} Omar Ramadan}
+\cfoot{\small\color{graytext}\thepage}
+\renewcommand{\headrulewidth}{0.25pt}
+
+\lstset{
+  basicstyle=\ttfamily\tiny,
+  breaklines=true,
+  frame=lines,
+  backgroundcolor=\color{panel},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=0pt,
+  xrightmargin=0pt,
+  linewidth=\textwidth,
+  breakindent=0pt
+}
+
+% -------------------- Math macros --------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\one}{\mathbf{1}}
+\newcommand{\KL}{\operatorname{KL}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\HPWL}{\operatorname{HPWL}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\relu}{\operatorname{ReLU}}
+\newcommand{\softmin}{\operatorname{softmin}}
+\newcommand{\Cat}{\operatorname{Categorical}}
+\newcommand{\Bern}{\operatorname{Bernoulli}}
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\LogNormal}{\operatorname{LogNormal}}
+\newcommand{\Perm}{\mathfrak{S}}
+\newcommand{\Branch}{\mathcal{D}}
+\newcommand{\Pset}{\mathcal{P}}
+\newcommand{\Bset}{\mathcal{B}}
+\newcommand{\Constraint}{\mathcal{C}}
+\newcommand{\Lagr}{\mathcal{L}}
+\newcommand{\Audit}{\mathcal{A}}
+\newcommand{\Score}{\mathcal{S}}
+\newcommand{\Std}{\mathcal{S}_{\rm std}}
+\newcommand{\Mac}{\mathcal{M}}
+\newcommand{\Clus}{\mathcal{K}}
+\newcommand{\seqp}{\sigma^+}
+\newcommand{\seqm}{\sigma^-}
+\newcommand{\rankp}{r^+}
+\newcommand{\rankm}{r^-}
+\newcommand{\PD}{\operatorname{PDLayer}}
+\newcommand{\ExactOv}{O_{\rm exact}}
+\newcommand{\WireNorm}{W_{\rm norm}}
+\newcommand{\diag}{\operatorname{diag}}
+
+\newcommand{\callout}[3]{%
+\medskip\noindent\textbf{\textcolor{#1}{#2.}}\par\noindent #3\par\medskip
+}
+
+\newcommand{\smalltitle}[1]{\vspace{0.25em}\noindent\textbf{\color{navy}#1}\par}
+
+\begin{document}
+
+\begin{center}
+{\Huge\bfseries\color{navy} Policy-Conditioned Primal-Dual Branch PPO Placement}\\[0.25em]
+{\Large\color{graytext} Learned ordering, outcome distillation, and a declared constrained-geometry transition}\\[0.8em]
+{\large Omar Ramadan}
+\end{center}
+
+\callout{green!70!black}{Thesis}{PPO should own the decisions that determine the placement basin: global ordering, stochastic standard-cell organization, residual motion, primal-dual controls, active-set emphasis, temperature, and stopping. It should not be forced to rediscover exact rectangle separation through raw coordinate noise alone. A signed primal-dual layer is therefore part of the declared environment transition: it executes the constrained geometry implied by the policy's choices. Exact audits expose missed inequalities and score official metrics; they never act as a hidden post-hoc legalizer. A prior hand-engineered solver may be used only as an \emph{offline demonstration source}: the model may distill outcome geometry from it before PPO, but the teacher is never called during rollout, inference, candidate selection, or final evaluation.}
+
+\callout{orange!80!black}{Non-heuristic boundary}{The primal-dual coordinate layer is legitimate because it is inside the Markov transition, its budget and schedule are policy-conditioned, and its constraints are declared. It would become illegitimate only if it appeared after the rollout as a secret cleanup pass. The policy chooses the ordering, residual motion, pressure schedule, and optimization controls; the signed constrained layer executes those choices.}
+
+\callout{navy}{One-sentence method}{Optionally warm-start the policy from offline outcome demonstrations, then sample global order, sample regions, sample residual motion, sample pressure and primal-dual budget, execute a declared signed augmented-Lagrangian transition, audit exact overlaps as cutting planes, reward Lagrangian and official-metric improvement, and return a declared policy-generated candidate.}
+
+\section{Design Contract}
+
+The method deliberately marries two outlooks:
+\begin{itemize}
+    \item \textbf{Stochastic policy ownership:} PPO controls the discrete ordering structure, residual motion, constraint emphasis, primal-dual schedule, and terminal decision.
+    \item \textbf{Constrained geometric correctness:} exact non-overlap is an inequality-constrained geometry problem, so the transition should use signed constraints, dual pressure, and exact audits.
+    \item \textbf{Teacher only as initialization:} an older solver may provide offline outcome demonstrations, but it must not appear as an online repair rule, inference-time fallback, or checkpoint-selection mechanism.
+\end{itemize}
+
+The resulting contract is:
+\[
+\boxed{\begin{gathered}
+    \text{PPO owns branch decisions and controls;}\\
+    \text{primal-dual dynamics executes declared geometry;}\\
+    \text{exact audit discovers missed inequalities.}
+\end{gathered}}
+\]
+
+This avoids both extremes. It does not reduce RL to a decorative wrapper around a legalizer, and it does not ask a stochastic coordinate-flow head to solve all pairwise non-overlap from scratch. The important distinction is that the constrained dynamics is a visible, parameterized environment transition, not a private post-processing routine.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.22\textwidth}YY}
+\toprule
+Question & Pure stochastic answer & Unified answer \\
+\midrule
+Who owns ordering? & PPO & PPO \\
+Who owns region structure? & PPO & PPO \\
+Who proposes motion? & PPO coordinate flow & PPO residual coordinate flow \\
+Who executes constrained geometry? & Reward pressure only & Policy-conditioned signed primal-dual transition \\
+What does audit do? & Score/reward only & Score plus cutting-plane discovery \\
+Is there a hidden legalizer? & No & No \\
+What is final output? & Terminal rollout & Declared terminal or audited policy ensemble mode \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Core Claim and Non-Claims}
+
+The central claim is not that PPO replaces numerical optimization. The central claim is that PPO should choose the \emph{combinatorial branch structure} and the \emph{optimization controls} that define a constrained transition. In particular,
+\[
+    \text{PPO selects }(S_t,z_t,\Delta X_t^{\rm res},\xi_t^{\rm PD},\omega_t^{\rm pair},\tau_t,b_t^{\rm stop}),
+\]
+while the policy-conditioned primal-dual layer evaluates the signed inequalities implied by those choices.
+
+\callout{purple!70!black}{What is being learned}{The learned object is not a hidden legalizer. It is a distribution over global orderings, region assignments, residual movement fields, multiplier schedules, active-set emphasis, and stop decisions. This is the part that determines whether the trajectory enters a useful basin rather than polishing a bad local ordering.}
+
+\callout{red!75!black}{What is not claimed}{The method does not claim global optimality, and it does not claim that raw PPO can solve all geometric constraints unaided. It claims a principled middle ground: learned branch selection and learned optimization controls, followed by a declared signed constrained transition and exact metric audits.}
+
+\section{Offline Outcome Distillation from the Prior Solver}
+
+The prior deterministic solver is useful, but only as a source of offline demonstrations. It should not be copied as a set of gates, and it should not be called during inference. The safe transfer principle is
+\[
+\boxed{\text{distill geometric outcomes, not heuristic rules.}}
+\]
+The teacher may show the policy what a legal low-overlap placement looks like, but it must not teach the policy to invoke named procedures such as anchor gates, squeeze portfolios, case-specific macro search, or spread-first retries.
+
+\callout{orange!80!black}{Teacher boundary}{The demonstration generator is outside the evaluated policy. It may be used to produce supervised pretraining data before PPO. It may not be used inside \texttt{train\_placement}, inside Mode A, inside Mode B, during candidate selection, or as a post-rollout repair step. Final candidates must be produced only by the policy-conditioned primal-dual transition and scored by exact metrics.}
+
+\subsection{Teacher dataset}
+
+For each generated or benchmark-like netlist $n$, run the teacher offline and store
+\[
+    \mathcal D_{\rm teach}=\{(G^{(n)},X_0^{(n)},X_\star^{(n)},O_\star^{(n)},W_\star^{(n)},\mathcal T^{(n)})\}_{n=1}^N,
+\]
+where $X_0$ is the initial placement, $X_\star$ is the teacher's final placement, $O_\star=\ExactOv(X_\star)$, $W_\star=\WireNorm(X_\star)$, and $\mathcal T$ optionally contains intermediate teacher states. The teacher trajectory is helpful but not required; initial-final pairs are enough to supervise branch structure, rough residual movement, active-pair emphasis, and safe stopping.
+
+Teacher samples receive confidence weights
+\[
+    w_{\rm demo}^{(n)}=
+    \exp\!\left(-\alpha_O O_\star^{(n)}-\alpha_W W_\star^{(n)}\right)
+    \one\{O_\star^{(n)}\le O_{\rm max}^{\rm demo}\}.
+\]
+Zero-overlap, lower-wirelength outcomes dominate the pretraining signal. Poor teacher outputs are either downweighted or excluded, so the learned policy does not inherit weak placements.
+
+\subsection{Outcome labels}
+
+The branch target induced by a teacher placement is
+\[
+    d_{ij}^{\star}=\arg\min_{d\in\Branch} c_{ij}(X_\star;d),
+    \qquad (i,j)\in\Pset_{\rm teach}.
+\]
+This target says which separation relation was realized in the teacher's legal geometry. It does not reveal which hand-coded gate produced the geometry. Similarly, define a residual-flow target
+\[
+    \Delta X^{\star}=\operatorname{clip}(X_\star-X_0,\Delta_{\max})
+\]
+for initial-final demonstrations, or
+\[
+    \Delta X_t^{\star}=\operatorname{clip}(X_{t+1}^{\rm teach}-X_t^{\rm teach},\Delta_{\max})
+\]
+when intermediate teacher states are available. Active-pair targets are pairs that are overlapping, near-overlapping, strongly connected, or separation-critical in the teacher solution. Stop targets are positive only for exact-legal teacher states and negative for intermediate or overlapping states.
+
+\subsection{Distillation losses}
+
+The supervised warm-start loss is
+\[
+\begin{aligned}
+    \mathcal L_{\rm distill}
+    =&\ \lambda_{\rm br}\mathcal L_{\rm branch}
+    +\lambda_{\rm flow}\mathcal L_{\rm flow}
+    +\lambda_{\rm pair}\mathcal L_{\rm pair}\\
+    &+\lambda_{\rm stop}\mathcal L_{\rm stop}
+    +\lambda_V\mathcal L_V
+    +\lambda_{\rm eq}\mathcal L_{\rm equivariance},
+\end{aligned}
+\]
+with
+\[
+    \mathcal L_{\rm branch}
+    =-\sum_{(i,j)\in\Pset_{\rm teach}}
+    w_{\rm demo}\log \pi_\theta(d_{ij}^{\star}\mid s),
+\]
+\[
+    \mathcal L_{\rm flow}
+    =\sum_i w_{\rm demo}
+    \left\|\mu_\theta(h_i,c)-\Delta x_i^{\star}\right\|_2^2,
+\]
+\[
+    \mathcal L_{\rm pair}
+    =-\sum_{(i,j)\in\Pset_{\rm teach}^{\star}}
+    w_{\rm demo}\log q_\psi(i,j\mid s),
+\]
+\[
+    \mathcal L_{\rm stop}
+    =-w_{\rm demo}\left[b^{\star}\log p_\theta^{\rm stop}+(1-b^{\star})\log(1-p_\theta^{\rm stop})\right].
+\]
+A value target can be defined by the teacher outcome quality:
+\[
+    V^{\star}(s)=-\left(\lambda_O \ExactOv(X_\star)+\lambda_W\WireNorm(X_\star)\right),
+    \qquad
+    \mathcal L_V=(V_\theta(s)-V^{\star}(s))^2.
+\]
+
+\subsection{DAgger-style correction and teacher annealing}
+
+Pure behavior cloning can be brittle because it trains only on teacher states. To reduce distribution shift, run partial policy rollouts, collect the states actually visited by the current policy, and label those states using teacher-derived geometric outcomes when affordable. This produces a DAgger-style correction set \cite{ross2011dagger}:
+\[
+    s_t\sim\pi_\theta,
+    \qquad
+    y_t^{\star}=\operatorname{OutcomeLabel}(s_t;\text{teacher}).
+\]
+The teacher loss must then be annealed away:
+\[
+    \lambda_{\rm teacher}(u)=\lambda_0\exp(-ku),
+    \qquad
+    \lim_{u\to\infty}\lambda_{\rm teacher}(u)=0.
+\]
+Final PPO fine-tuning and all reported inference runs use no teacher calls. The teacher is a warm-start curriculum, not a dependency.
+
+\callout{green!70!black}{Distillation validity rule}{A run may claim teacher transfer only if it logs the teacher-data source, demo acceptance threshold, demonstration quality weights, branch-imitation accuracy, stop false-positive rate after pretraining, and the annealing schedule proving that teacher loss reaches zero before final evaluation.}
+
+
+\section{Challenge Objective and Repository API}
+
+The repository provides cell features
+\[
+    \texttt{cell\_features}_i
+    = [a_i,n_i^{\rm pins},x_i,y_i,w_i,h_i],
+\]
+pin features, and an edge list. The required public function returns final cell features with updated centers:
+\[
+\begin{gathered}
+    \texttt{train\_placement(cell\_features, pin\_features, edge\_list, ...)}\\
+    \longrightarrow
+    \{\texttt{``final\_cell\_features''}:\;\widehat{\texttt{cell\_features}}\}.
+\end{gathered}
+\]
+
+Let $X\in\R^{N\times 2}$ denote cell centers. The benchmark is lexicographic in spirit:
+\[
+    \min_X \left(\ExactOv(X),\;\WireNorm(X),\;T_{\rm runtime}\right),
+\]
+where exact overlap dominates normalized wirelength. Training may use smooth surrogates, but validation and model selection must report the official exact overlap and normalized wirelength metrics.
+
+\callout{blue!70!black}{No assumed fixed die outline}{If the challenge does not specify a hard outline, boundary pressure is a learned or derived spreading prior, not an undocumented external legalizer. If a die outline is provided, boundary inequalities become official constraints.}
+
+\section{Rectangle Geometry}
+
+Each cell $i$ has center $(x_i,y_i)$ and dimensions $(w_i,h_i)$. For two cells $i,j$, define exact overlap widths
+\[
+    o^x_{ij}(X)=\left[\frac{w_i+w_j}{2}-|x_i-x_j|\right]_+,
+    \qquad
+    o^y_{ij}(X)=\left[\frac{h_i+h_j}{2}-|y_i-y_j|\right]_+,
+\]
+and exact overlap area
+\[
+    a^{\rm ov}_{ij}(X)=o^x_{ij}(X)o^y_{ij}(X).
+\]
+The exact overlap metric is computed by the repository or by an equivalent exact spatial-hash audit.
+
+Non-overlap is the disjunction
+\[
+    i\prec_x j
+    \quad\vee\quad
+    j\prec_x i
+    \quad\vee\quad
+    i\prec_y j
+    \quad\vee\quad
+    j\prec_y i.
+\]
+Let
+\[
+    \Branch=\{L,R,B,A\},
+\]
+where $L$ means $i$ is left of $j$, $R$ means $j$ is left of $i$, $B$ means $i$ is below $j$, and $A$ means $j$ is below $i$. Define signed branch inequalities $c_{ij}(X;d)\le0$:
+\[
+\begin{aligned}
+    c_{ij}(X;L) &= x_i+\frac{w_i}{2}-x_j+\frac{w_j}{2},
+    &c_{ij}(X;R) &= x_j+\frac{w_j}{2}-x_i+\frac{w_i}{2},\\
+    c_{ij}(X;B) &= y_i+\frac{h_i}{2}-y_j+\frac{h_j}{2},
+    &c_{ij}(X;A) &= y_j+\frac{h_j}{2}-y_i+\frac{h_i}{2}.
+\end{aligned}
+\]
+The positive violation
+\[
+    c^+_{ij}(X;d)=\max\{c_{ij}(X;d),0\}
+\]
+is useful for logging, but the constrained layer uses the signed $c_{ij}$ itself.
+
+\section{State, Action, and Transition}
+
+At step $t$, the environment state is
+\[
+    s_t=(G,X_t,H_t,\lambda_t,\Pset_t,\Audit_t),
+\]
+where $G$ is the netlist graph, $X_t$ are centers, $H_t$ is recurrent policy memory, $\lambda_t$ are dual variables, $\Pset_t$ is the active pair set, and $\Audit_t$ contains exact/sampled geometry observations.
+
+A graph encoder produces equivariant node embeddings and global context:
+\[
+    (h_1,\ldots,h_N,c_t)=f_\theta(G,X_t,H_t,\lambda_t,\Pset_t,\Audit_t).
+\]
+
+The action is a structured stochastic object:
+\[
+    a_t=\left(
+    S_t^{\rm macro},
+    z_t,
+    S_t^{\rm cluster},
+    \Delta X_t^{\rm res},
+    \xi_t^{\rm PD},
+    \omega_t^{\rm pair},
+    \tau_t,
+    b_t^{\rm stop}
+    \right).
+\]
+Here:
+\begin{itemize}
+    \item $S_t^{\rm macro}$ is a sequence pair or DAG ordering for macros.
+    \item $z_t$ is a stochastic standard-cell region or cluster assignment.
+    \item $S_t^{\rm cluster}$ is a sequence pair or DAG ordering over clusters.
+    \item $\Delta X_t^{\rm res}$ is a continuous residual coordinate-flow proposal.
+    \item $\xi_t^{\rm PD}$ contains policy-conditioned primal-dual controls such as $K_t,\rho_t,\eta_t,\alpha_t$, and pressure multipliers.
+    \item $\omega_t^{\rm pair}$ controls active-pair sampling or retention emphasis.
+    \item $\tau_t$ controls soft-to-hard ordering temperature.
+    \item $b_t^{\rm stop}$ is the sampled stopping decision.
+\end{itemize}
+
+The transition is
+\[
+    X_{t+1}=\PD\left(
+        X_t+r_t^{\rm step}\tanh(\Delta X_t^{\rm res}),
+        D(S_t),
+        \lambda_t,
+        \Pset_t,
+        \xi_t^{\rm PD}
+    \right).
+\]
+This is the central synthesis: PPO proposes the basin-defining order and residual motion, while the declared primal-dual dynamics performs the constrained geometric transition. The layer may move coordinates, but only according to policy-conditioned controls and explicitly exposed constraints.
+
+\section{Policy Factorization}
+
+A practical factorization is
+\[
+\begin{aligned}
+\pi_\theta(a_t\mid s_t)
+&=\pi_\theta(S_t^{\rm macro}\mid s_t)
+\prod_{i\in\Std}\pi_\theta(z_{i,t}\mid h_i,c_t)\\
+&\quad\cdot
+\pi_\theta(S_t^{\rm cluster}\mid z_t,s_t)
+\prod_{i=1}^N\pi_\theta(\Delta x^{\rm res}_{i,t},\Delta y^{\rm res}_{i,t}\mid h_i,c_t)\\
+&\quad\cdot
+\pi_\theta(\xi_t^{\rm PD}\mid c_t)
+\pi_\theta(\omega_t^{\rm pair}\mid c_t,\Audit_t)
+\pi_\theta(\tau_t\mid c_t)
+\pi_\theta(b_t^{\rm stop}\mid c_t).
+\end{aligned}
+\]
+The policy is not a pure ordering-only actor. It controls the order, residual motion, amount of constrained dynamics, constraint pressure, active-set emphasis, temperature, and stop rule.
+
+\subsection{Residual coordinate-flow head}
+
+The continuous flow action is
+\[
+    (\Delta x_i^{\rm res},\Delta y_i^{\rm res})
+    \sim \Normal\!\left(\mu_\theta(h_i,c_t),\Sigma_\theta(h_i,c_t)\right).
+\]
+Use diagonal local noise plus low-rank global noise:
+\[
+    \Delta X_t^{\rm res}
+    =\mu_\theta
+    +\epsilon_{\rm local}\odot\sigma_\theta
+    +U_\theta\epsilon_{\rm global}.
+\]
+This preserves the first outlook's insight: stochastic coordinate flow can create global spreading and local nudges that are hard to express as discrete order changes alone.
+
+\subsection{Policy-conditioned primal-dual controls}
+
+The policy samples or predicts
+\[
+    \xi_t^{\rm PD}=\left(K_t,\rho_t,\eta_t,\alpha_t,\nu_t^{\rm branch},\nu_t^{\rm density},\nu_t^{\rm boundary}\right),
+\]
+with positive quantities parameterized by softplus or log-normal heads, for example
+\[
+    \rho_t=\softplus(r_\theta(c_t))+\rho_{\min},
+    \qquad
+    K_t\sim\Cat(k_\theta(c_t)),
+    \qquad
+    \nu_t^e\sim\LogNormal(m_\theta(e,c_t),s_\theta(e,c_t)).
+\]
+The learned pressure terms can scale constraint penalties, pair sampling priorities, or dual warm starts. The hard dual update remains mathematically defined; the policy controls emphasis and schedule.
+
+\callout{blue!70!black}{Recommended implementation order}{Implement the method in layers: first sequence-pair branch induction, then the PHR constrained transition, then exact active-set audit, then PPO over ordering and primal-dual controls, then residual coordinate flow, and finally hierarchical standard-cell clustering. This makes the research code testable without weakening the final formulation.}
+
+\section{Global Ordering Instead of Independent Pair Branches}
+
+Independent pairwise branch samples are locally expressive but globally dangerous: they can create cycles, antisymmetry errors, and brittle credit assignment. The unified method samples a global ordering object and derives pairwise branches from it.
+
+\subsection{Sequence-pair action}
+
+For an ordered set of objects, a sequence pair is
+\[
+    S_t=(\seqp_t,\seqm_t)\in\Perm_m\times\Perm_m.
+\]
+Let
+\[
+    \rankp_i=\operatorname{rank}_{\seqp}(i),
+    \qquad
+    \rankm_i=\operatorname{rank}_{\seqm}(i).
+\]
+For each unordered pair $(i,j)$, the induced branch is
+\[
+D_{ij}(S)=
+\begin{cases}
+    L, & \rankp_i<\rankp_j\ \text{and}\ \rankm_i<\rankm_j,\\
+    R, & \rankp_i>\rankp_j\ \text{and}\ \rankm_i>\rankm_j,\\
+    B, & \rankp_i<\rankp_j\ \text{and}\ \rankm_i>\rankm_j,\\
+    A, & \rankp_i>\rankp_j\ \text{and}\ \rankm_i<\rankm_j.
+\end{cases}
+\]
+The active non-overlap constraint is
+\[
+    c_{ij}\bigl(X;D_{ij}(S)\bigr)\le0.
+\]
+
+\callout{green!70!black}{Why this matters}{PPO no longer chooses $4^{|\Pset_t|}$ unrelated local branch labels. It chooses two global permutations. Branch antisymmetry and acyclicity follow by construction.}
+
+\subsection{Hierarchical ordering}
+
+For large standard-cell counts, use hierarchy:
+\begin{enumerate}
+    \item Macros receive a macro ordering $S_t^{\rm macro}$.
+    \item Standard cells sample region or cluster labels $z_i$.
+    \item Clusters receive a cluster ordering $S_t^{\rm cluster}$.
+    \item Within a cluster, local flow and local pair constraints handle detail placement.
+\end{enumerate}
+
+Each standard cell samples
+\[
+    z_i\sim\Cat(\ell_\theta(h_i,c_t)),\qquad i\in\Std,
+\]
+and each cluster embedding is
+\[
+    u_k=\frac{\sum_{i\in\Std}\one\{z_i=k\}h_i}{1+\sum_{i\in\Std}\one\{z_i=k\}}.
+\]
+This reduces the action dimension while preserving PPO credit assignment for region choices.
+
+\subsection{Acyclic DAG alternative}
+
+If sequence pairs are too restrictive, use two learned precedence DAGs
+\[
+    G_x=(V,E_x),\qquad G_y=(V,E_y),
+\]
+where $i\rightarrow j$ in $G_x$ means $i$ is left of $j$, and $i\rightarrow j$ in $G_y$ means $i$ is below $j$. Acyclicity must be enforced before constraints are built. Sequence pairs are simpler because they avoid an explicit cycle-repair module.
+
+\section{Permutation Equivariance and Antisymmetry}
+
+Cell IDs are arbitrary. Relabeling cells by a permutation $P$ should relabel the placement, not change the physical answer:
+\[
+    \pi_\theta(P\seqp,P\seqm\mid PG)
+    =\pi_\theta(\seqp,\seqm\mid G).
+\]
+The induced branch matrix then satisfies
+\[
+    D_{P(i),P(j)}(P\seqp,P\seqm)=D_{ij}(\seqp,\seqm).
+\]
+Antisymmetry is automatic:
+\[
+    D_{ji}=\operatorname{inv}(D_{ij}),
+    \qquad
+    \operatorname{inv}(L)=R,
+    \quad
+    \operatorname{inv}(B)=A.
+\]
+
+\callout{purple!70!black}{Implementation rule}{Never train an unconstrained ordered-pair head that can output unrelated logits for $(i,j)$ and $(j,i)$. Either derive branches from a global ordering, or hard-tie logits so inverse relations are guaranteed.}
+
+\section{Soft-to-Hard Ordering Continuation}
+
+Hard sequence-pair sampling can overcommit early. Use soft permutation relaxations during early training and harden gradually.
+
+Let
+\[
+    p^+_{ij}=\Pr_\theta(i\prec_{\seqp}j\mid s_t),
+    \qquad
+    p^-_{ij}=\Pr_\theta(i\prec_{\seqm}j\mid s_t).
+\]
+The induced soft branch weights are
+\[
+\begin{aligned}
+    q_{ij}(L)&=p^+_{ij}p^-_{ij},
+    &q_{ij}(R)&=(1-p^+_{ij})(1-p^-_{ij}),\\
+    q_{ij}(B)&=p^+_{ij}(1-p^-_{ij}),
+    &q_{ij}(A)&=(1-p^+_{ij})p^-_{ij}.
+\end{aligned}
+\]
+These preserve antisymmetry:
+\[
+    q_{ij}(L)=q_{ji}(R),
+    \qquad
+    q_{ij}(B)=q_{ji}(A).
+\]
+
+Define a soft signed disjunction
+\[
+    \widetilde g_{ij}(X;q,\tau)
+    =-\tau\log\sum_{d\in\Branch}
+    q_{ij}(d)\exp\!\left(-\frac{c_{ij}(X;d)}{\tau}\right),
+\]
+and impose
+\[
+    \widetilde g_{ij}(X;q,\tau)\le0.
+\]
+The smooth minimum is applied to signed constraints, not to positive violations. Negative slack remains informative.
+
+\section{Constraint Set}
+
+The active constraint set at step $t$ is
+\[
+\begin{aligned}
+\Constraint_t(S_t)
+=&\ \{c_{ij}(X;D_{ij}(S_t)):(i,j)\in\Pset_t\}\\
+&\cup\{b_i^x(X),b_i^y(X): i=1,\ldots,N\}\\
+&\cup\{d_b(X): b\in\Bset_t\}.
+\end{aligned}
+\]
+The first term contains ordering-induced non-overlap inequalities. The second contains boundary/outline constraints when meaningful. The third contains soft density or anti-collapse constraints.
+
+\subsection{Boundary constraints}
+
+If an outline $[x_{\min},x_{\max}]\times[y_{\min},y_{\max}]$ is given or chosen by the policy, use
+\[
+\begin{aligned}
+    b^x_{i,L}(X)&=x_{\min}+\frac{w_i}{2}-x_i\le0,
+    &b^x_{i,R}(X)&=x_i+\frac{w_i}{2}-x_{\max}\le0,\\
+    b^y_{i,B}(X)&=y_{\min}+\frac{h_i}{2}-y_i\le0,
+    &b^y_{i,T}(X)&=y_i+\frac{h_i}{2}-y_{\max}\le0.
+\end{aligned}
+\]
+If no official outline exists, these constraints become soft spreading priors rather than hard benchmark constraints.
+
+\subsection{Density and anti-collapse constraints}
+
+Wirelength pulls connected cells toward common net centers. Without spreading pressure, the wirelength term can collapse cells before pair constraints become informative. Use density-bin constraints
+\[
+    d_b(X)=\rho_b(X)-\rho_{\max}\le0,
+    \qquad b\in\Bset_t,
+\]
+where $\rho_b(X)$ is a differentiable area-density estimate. These constraints create global pressure before exact pair collisions dominate.
+
+\section{Policy-Conditioned PHR Inequality Augmented Lagrangian}
+
+For constraints $g_e(X)\le0$ indexed by $e\in\Constraint_t$, use the Powell--Hestenes--Rockafellar inequality augmented Lagrangian:
+\[
+    \Lagr_{\rho_t}(X,\lambda_t;\Constraint_t)
+    =W(X)+\eta_t\|X-X_t^{\rm base}\|_2^2
+    +\sum_{e\in\Constraint_t}
+    \frac{\nu_{e,t}}{2\rho_t}
+    \left(
+        [\lambda_{e,t}+\rho_t g_e(X)]_+^2-\lambda_{e,t}^2
+    \right).
+\]
+Here $W(X)$ is a differentiable wirelength surrogate, $X_t^{\rm base}=X_t+r_t^{\rm step}\tanh(\Delta X_t^{\rm res})$ is the policy-proposed base point, $\eta_t$ is a policy-conditioned trust-region weight, and $\nu_{e,t}$ is optional learned pressure/emphasis.
+
+The coordinate layer performs $K_t$ primal steps:
+\[
+    X_{t,k+1}=X_{t,k}-\alpha_t
+    \nabla_X\Lagr_{\rho_t}(X_{t,k},\lambda_t;\Constraint_t),
+    \qquad k=0,\ldots,K_t-1,
+\]
+with initialization
+\[
+    X_{t,0}=X_t^{\rm base}.
+\]
+The next state is
+\[
+    X_{t+1}=X_{t,K_t}.
+\]
+
+The layer is not a stand-alone placer: $K_t,\rho_t,\eta_t,\alpha_t$, pressure weights, pair emphasis, and temperature are policy outputs or declared schedules observed by the policy. Thus the transition is reproducible and auditable, but not a hidden legalizer.
+
+Dual variables update by
+\[
+    \lambda_{e,t+1}=[\lambda_{e,t}+\rho_t g_e(X_{t+1})]_+.
+\]
+This update increases multipliers for violated constraints and decreases them when constraints have sufficient slack.
+
+\subsection{Dual identity under branch changes}
+
+A branch flip changes the identity of the active inequality. Store duals by pair and branch:
+\[
+    \lambda_{ij,d}\quad\text{for}\quad d\in\{L,R,B,A\}.
+\]
+If $d=D_{ij}(S_t)$ is active, update $\lambda_{ij,d}$. Inactive branch duals decay:
+\[
+    \lambda_{ij,d,t+1}\leftarrow \kappa\lambda_{ij,d,t},
+    \qquad 0<\kappa<1,
+\]
+unless they re-enter the active set. This avoids stale multipliers from previous orderings.
+
+\section{Exact Audit as Cutting-Plane Discovery}
+
+The implementation should not include all $N(N-1)/2$ pair constraints at every step. Instead, use an active set:
+\[
+    \Pset_t\subseteq\{(i,j):1\le i<j\le N\}.
+\]
+Initialize $\Pset_t$ with a broad, deterministic spatial-hash pass plus policy-emphasized near pairs, strongly connected pairs, and high-uncertainty pairs. This is an active-set representation of constraints, not a placement rule.
+
+After the primal-dual transition, perform an exact audit periodically or every step when affordable:
+\[
+    \Audit(X_{t+1})=\{(i,j):a^{\rm ov}_{ij}(X_{t+1})>0\}.
+\]
+Then update
+\[
+    \Pset_{t+1}=\operatorname{Retain}(\Pset_t)\cup\Audit(X_{t+1})\cup\operatorname{SampleNear}(X_{t+1},\omega_t^{\rm pair}).
+\]
+No pair is permanently declared safe. Hard pairs remain cached for a horizon.
+
+\callout{orange!80!black}{Audit is not legalization}{The audit does not move cells. It only reveals missed inequalities and provides exact metrics. Geometry changes only through the policy-conditioned transition.}
+
+\section{Reward}
+
+The per-step reward should match the constrained transition. Compute same-dual Lagrangian decrease before the dual update:
+\[
+    r_t^{\rm AL}
+    =\Lagr_{\rho_t}(X_t,\lambda_t;\Constraint_t)
+    -\Lagr_{\rho_t}(X_{t+1},\lambda_t;\Constraint_t).
+\]
+Both terms use the same constraint set and the same dual state.
+
+Add official-metric improvement when exact evaluation is affordable:
+\[
+    r_t^{\rm exact}
+    =\alpha_O\bigl(\widehat O(X_t)-\widehat O(X_{t+1})\bigr)
+    +\alpha_W\bigl(\widehat W_{\rm norm}(X_t)-\widehat W_{\rm norm}(X_{t+1})\bigr),
+\]
+where $\widehat O$ may be exact or sampled during training, but validation must use the official metric.
+
+Add entropy and movement regularization:
+\[
+    r_t=r_t^{\rm AL}+r_t^{\rm exact}
+    +\alpha_H H(\pi_\theta(\cdot\mid s_t))
+    -\alpha_M\|X_{t+1}-X_t\|_2^2.
+\]
+The entropy term is not decoration: it delays premature commitment to a single ordering branch during the early soft-to-hard continuation phase. As training hardens, entropy can be annealed while exact-audit rewards become more frequent.
+
+If the stop action fires, add
+\[
+    r_t^{\rm stop}
+    =\beta_0\one\{\ExactOv(X_{t+1})=0\}
+    -\beta_1\ExactOv(X_{t+1})
+    -\beta_2\WireNorm(X_{t+1}).
+\]
+This teaches the policy to stop only when the sampled trajectory has achieved benchmark legality.
+
+\section{Metric-Aligned Fine-Tuning Controls}
+
+The preceding reward defines the constrained transition. The training run, however, must also prevent a common failure mode: the shaped Lagrangian reward improves while exact benchmark overlap regresses. To make the training code match the mathematical objective, define validation metrics at update $u$:
+\[
+    m_u=(\bar O_u,\bar W_u,\bar V_u,\bar M_u,\bar S_u),
+\]
+where $\bar O_u$ is deterministic validation exact-overlap ratio, $\bar W_u$ is deterministic validation normalized wirelength, $\bar V_u$ is mean branch violation, $\bar M_u$ is the number of missed pairs found by exact audit, and $\bar S_u$ is stop rate.
+
+\subsection{Metric-gated soft-to-hard continuation}
+
+Let $O_u^{\star}$ denote the best validation overlap seen before update $u$:
+\[
+    O_u^{\star}=\min_{v<u}\bar O_v.
+\]
+Define the exact-overlap improvement indicator
+\[
+    I_u^{O}=\one\{\bar O_u < O_u^{\star}-\epsilon_O\},
+\]
+and the hardening-stability predicate
+\[
+    H_u=\one\{\bar V_u\le V_{\max}\}\one\{\bar M_u\le M_{\max}\}.
+\]
+The temperature should not be annealed by update count alone. It should be annealed only when exact overlap improves and the induced ordering constraints remain stable:
+\[
+\tau_{u+1}=\begin{cases}
+    \max(\tau_{\min},\gamma_{\downarrow}\tau_u),
+        & I_u^{O}=1\ \text{and}\ H_u=1,\\
+    \min(\tau_{\max},\gamma_{\uparrow}\tau_u),
+        & I_u^{O}=0\ \text{for }p\text{ validation windows},\\
+    \tau_u, & \text{otherwise.}
+\end{cases}
+\]
+Here $0<\gamma_{\downarrow}<1$ and $\gamma_{\uparrow}>1$. This formalizes the implementation condition: harden only when exact overlap improves, branch violation is low, and missed pairs are low. If hardening causes exact-overlap regression, the relaxation is softened again rather than forcing PPO into a bad sequence-pair basin.
+
+\subsection{Overlap-gated stop policy}
+
+Let $\ell_t^{\rm stop}$ be the stop-head logit before sampling $b_t^{\rm stop}$. The stop decision should be discouraged while exact overlap remains high:
+\[
+    \ell_{t,{\rm gated}}^{\rm stop}
+    =\ell_t^{\rm stop}
+    -\kappa_{\rm stop}\one\{\widehat O_t>O_{\rm stop}\}.
+\]
+The stop reward becomes
+\[
+    r_t^{\rm stop}=\begin{cases}
+    \beta_0-\beta_2\WireNorm(X_{t+1}),
+        & b_t^{\rm stop}=1\ \text{and}\ \ExactOv(X_{t+1})=0,\\
+    -\beta_1(1+\ExactOv(X_{t+1}))
+    -\beta_3\one\{\ExactOv(X_{t+1})\ge \widehat O_t\},
+        & b_t^{\rm stop}=1\ \text{and}\ \ExactOv(X_{t+1})>0,\\
+    0, & b_t^{\rm stop}=0.
+\end{cases}
+\]
+Thus stopping is not merely a high-return action. It is a terminal decision that must be justified by exact legality or clear overlap progress.
+
+\subsection{Lexicographic reward alignment}
+
+Define exact or validation-aligned metric changes
+\[
+    \Delta_O=\widehat O(X_t)-\widehat O(X_{t+1}),
+    \qquad
+    \Delta_W=\widehat W_{\rm norm}(X_t)-\widehat W_{\rm norm}(X_{t+1}).
+\]
+The aligned reward is
+\[
+\begin{aligned}
+    r_t^{\rm align}
+    =&\ r_t^{\rm AL}
+    +\lambda_O\Delta_O
+    -\lambda_{O^-}[-\Delta_O]_+ \\
+    &+\lambda_W\Delta_W\one\{\Delta_O\ge -\epsilon_{\rm gate}\}
+    -\lambda_V\bar V_{t+1}
+    -\lambda_M\bar M_{t+1}
+    +\alpha_H H(\pi_\theta(\cdot\mid s_t)).
+\end{aligned}
+\]
+The key asymmetry is intentional: overlap regression is penalized more strongly than overlap improvement is rewarded, and wirelength improvement receives full credit only when overlap is not regressing. This aligns training with the benchmark's lexicographic rule rather than with shaped reward alone.
+
+\subsection{Exact-audit pressure}
+
+When exact audits continue to discover many missed pairs, the active-set mechanism should increase pressure rather than allowing the policy to optimize around an incomplete constraint set. Define
+\[
+    \chi_u=1+\gamma_M\left[\frac{\bar M_u-M_{\rm target}}{M_{\rm target}+\epsilon}\right]_+.
+\]
+The pair-retention horizon, exact-audit frequency, and near-pair sampling budget are scaled by $\chi_u$. This is not a geometric repair rule: it does not move cells. It only exposes more violated inequalities to the declared constrained transition.
+
+\subsection{Checkpoint selection by official metrics}
+
+The best model should not be selected by shaped reward. Maintain separate checkpoints:
+\[
+\begin{aligned}
+    u_O^{\star} &= \arg\min_u \bar O_u,\\
+    u_{\rm lex}^{\star} &= \arg\min_u (\bar O_u,\bar W_u),\\
+    u_{W\mid O\le \delta}^{\star} &= \arg\min_{u:\bar O_u\le\delta}\bar W_u.
+\end{aligned}
+\]
+The shaped-reward checkpoint may still be stored for debugging, but it should not replace the best-overlap or best-lexicographic model. A corrected fine-tune should resume from $u_O^{\star}$ when exact overlap is the bottleneck.
+
+\callout{red!75!black}{Alignment rule}{If reward improves while $\bar O_u$ worsens, the training objective is misaligned. The response is not to train longer from the latest checkpoint; it is to resume from the best-overlap checkpoint, restore a softer temperature, lower the learning rate, increase exact-audit pressure, and harden only when deterministic exact-overlap validation improves.}
+
+\section{PPO Objective for Structured Actions}
+
+For a huge composite action, a single global probability ratio can explode. Use group-normalized PPO ratios. Let $g$ index action groups: macro ordering, memberships, cluster ordering, residual flow, primal-dual controls, pair emphasis, temperature, and stop. Define
+\[
+    \rho_g(\theta)=\exp\left(
+    \frac{
+    \log\pi_{\theta,g}(a_{t,g}\mid s_t)-
+    \log\pi_{\theta_{\rm old},g}(a_{t,g}\mid s_t)
+    }{\sqrt{m_g}}
+    \right),
+\]
+where $m_g$ is the number of sampled tokens in the group.
+
+This is an engineering stabilization for very large structured actions, not a claim that the canonical PPO ratio must be replaced. The implementation should log both group ratios and the aggregate log-ratio so that clipping, KL, and advantage scaling remain auditable.
+
+The clipped objective is
+\[
+    \mathcal J_{\rm PPO}(\theta)=
+    \E_t\left[\sum_g\omega_g
+    \min\left(
+        \rho_g(\theta)\widehat A_t,
+        \clip(\rho_g(\theta),1-\epsilon,1+\epsilon)\widehat A_t
+    \right)\right].
+\]
+Advantages use GAE:
+\[
+    \widehat A_t=\sum_{l=0}^{T-t-1}(\gamma\lambda_{\rm GAE})^l
+    \left(r_{t+l}+\gamma V_\theta(s_{t+l+1})-V_\theta(s_{t+l})\right).
+\]
+The full loss is
+\[
+\begin{aligned}
+    \mathcal L(\theta)
+    =&-\mathcal J_{\rm PPO}(\theta)
+    +c_v\|V_\theta-\widehat R_t\|_2^2
+    -c_H H(\pi_\theta)\\
+    &+c_{\rm KL}\KL(\pi_{\theta_{\rm old}}\,\|\,\pi_\theta)
+    +c_{\rm eq}\mathcal L_{\rm equivariance}.
+\end{aligned}
+\]
+
+\section{Two Declared Inference Modes}
+
+The method can support two modes. The key is that the chosen mode must be declared before evaluation.
+
+\subsection{Mode A: terminal policy mode}
+
+This is the ideologically pure mode. Run one stochastic or low-temperature rollout and return the state at the policy's stop decision:
+\[
+    X_{\rm final}=X_{\tau},
+    \qquad
+    \tau=\min\{t:b_t^{\rm stop}=1\}\ \text{or}\ T.
+\]
+There is no final candidate selection. This mode best demonstrates that PPO owns the full process.
+
+\subsection{Mode B: audited policy ensemble mode}
+
+This is the competition mode. Run a small declared ensemble of policy rollouts or low-temperature samples, score every candidate by official metrics, and choose
+\[
+    X_{\rm final}
+    =\arg\min_{X\in\mathcal C_{\rm saved}}
+    \left(\ExactOv(X),\WireNorm(X)\right).
+\]
+This is not hidden legalization because it does not alter any candidate; it only selects among policy-generated candidates using the benchmark's own lexicographic criterion.
+
+\callout{purple!70!black}{Recommended default}{Use Mode B for benchmark performance and report Mode A as an ablation. That preserves honesty: the paper can show both pure stochastic ownership and practical exact-metric competitiveness.}
+
+\section{Training Curriculum}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.25\textwidth}Y}
+Stage -1: offline demonstrations & Run the prior solver offline and store outcome-only demonstrations: final legal geometry, branch labels, active-pair labels, residual-flow targets, stop labels, and value targets. \\
+Stage 0: outcome distillation & Pretrain branch, residual-flow, active-pair, stop, and value heads using confidence-weighted geometric labels; do not imitate named heuristic gates. \\
+Stage 1: normalization and warm starts & Normalize sizes, coordinates, wirelength, density, dual magnitudes, and randomize initial canvas scale/noise. \\
+Stage 2: residual flow pretraining & Train coordinate-flow proposals with overlap-heavy reward and high entropy; keep ordering soft and broad. \\
+Stage 3: soft ordering relaxation & Enable soft sequence-pair or DAG ordering with signed soft disjunctions $\widetilde g_{ij}\le0$. \\
+Stage 4: policy-conditioned PHR layer & Enable $K_t,\rho_t,\eta_t,\alpha_t$ controls and signed inequality AL transitions. \\
+Stage 5: metric-gated hard sequence-pair PPO & Sample discrete orderings and train group-normalized PPO on same-dual Lagrangian decrease plus exact metrics. \\
+Stage 6: active-set sharpening & Increase exact audit frequency, retain difficult pairs, strengthen density/boundary pressure, decay stale branch duals. \\
+Stage 7: overlap-gated stop policy & Train terminal stopping with exact-overlap reward and wirelength tie-breaker. \\
+Stage 8: inference calibration & Evaluate both terminal policy mode and audited policy ensemble mode with no hidden legalization. \\
+\end{tabularx}
+\end{center}
+
+\section{Minimal Build Plan}
+
+A credible implementation should be staged so that every layer can be validated independently:
+\begin{enumerate}
+    \item \textbf{Teacher dataset audit:} run the prior solver offline, remove low-quality demonstrations, and verify that no teacher call is present in the inference path.
+    \item \textbf{Outcome distillation only:} pretrain on branch labels, residual-flow targets, active-pair labels, stop labels, and value targets; do not clone named gates or case-specific solver choices.
+    \item \textbf{Branch induction only:} sample or construct sequence pairs and verify induced $L/R/B/A$ branches are antisymmetric and stable under relabeling.
+    \item \textbf{PHR transition only:} hold policy actions fixed and test that signed augmented-Lagrangian steps reduce branch, boundary, and density violations.
+    \item \textbf{Audit loop:} add exact overlap audits and verify that missed pairs enter $\Pset_t$ without directly moving cells.
+    \item \textbf{PPO controls:} train ordering, residual-flow, and $\xi_t^{\rm PD}$ heads using same-dual Lagrangian decrease and official metric improvements.
+    \item \textbf{Hierarchy:} enable standard-cell memberships and cluster orderings only after the macro/order/PHR core is stable.
+\end{enumerate}
+
+\callout{green!70!black}{Defensible MVP}{The smallest defensible version is outcome-distilled sequence-pair branch induction plus PHR transition plus exact audit plus PPO over ordering and PD controls. Residual flow, DAgger-style correction, and clustering improve robustness and scalability, but no teacher call is allowed during final inference.}
+
+
+\section{Implementation-Level Specification}
+
+This section makes the document implementation-complete. The policy-conditioned primal-dual placer is defined as a set of tensors, state objects, module APIs, algorithms, hyperparameters, and tests. A run that follows this section can be implemented without importing the prior heuristic at inference time.
+
+\subsection{Tensor conventions}
+
+All tensors are assumed to be PyTorch tensors unless otherwise stated. Coordinates use floating point tensors; index tensors use integer tensors. Cell centers are stored in columns 2 and 3 of the challenge tensor.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.24\textwidth}p{0.22\textwidth}Y}
+\toprule
+Object & Shape & Meaning \\
+\midrule
+\texttt{cell\_features} & $[N,6]$ & Per-cell area, pin count, $x$, $y$, width, height. The returned tensor overwrites columns $2:4$ with final centers. \\
+\texttt{pin\_features} & $[P,d_p]$ & Pin metadata and offsets supplied by the repository. The wirelength routine must use the same convention as repository scoring. \\
+\texttt{edge\_list} & $[E,2]$ or equivalent & Net/pin connectivity used to compute smooth wirelength and official normalized wirelength. \\
+$X$ & $[N,2]$ & Current cell centers. \\
+$S$ & $[N,2]$ & Cell sizes, where $S_i=(w_i,h_i)$. \\
+$\Pset_t$ & $[M_t,2]$ & Active unordered pair indices $(i,j)$ with $i<j$. \\
+$D_t$ & $[M_t]$ & Active branch label in $\{L,R,B,A\}$ induced by sequence-pair or DAG ordering. \\
+$\lambda_t$ & map or $[M_t,4]$ & Dual variables stored by pair and branch identity $(i,j,d)$. \\
+$\rho_{e,t}$ & $[|\Constraint_t|]$ & Effective PHR penalty for each active constraint. \\
+$b^{\rm stop}_t$ & scalar Bernoulli & Stop decision sampled by the policy head. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{State and action objects}
+
+The implementation should use explicit state and action containers so the transition is auditable. A minimal state is
+\[
+\begin{aligned}
+\texttt{PlacementState}=(&G,X,S,H,\lambda,\Pset,\Audit,\texttt{memberships},\\
+&\texttt{density\_bins},\texttt{outline},\texttt{metrics},\texttt{step}).
+\end{aligned}
+\]
+A minimal action is
+\[
+\begin{aligned}
+\texttt{PolicyAction}=(&S_t^{\rm macro},z_t,S_t^{\rm cluster},\Delta X_t^{\rm res},\\
+&K_t,\rho_t,\eta_t,\alpha_t,\nu_t,\omega_t^{\rm pair},\tau_t,b_t^{\rm stop}).
+\end{aligned}
+\]
+The policy may contain more heads, but every head must be logged and every sampled quantity used by the transition must be reproducible from the saved rollout record.
+
+
+\subsection{Required module APIs}
+
+The following functions define the implementation boundary. Each function should be covered by at least one unit test, and every function that changes geometry must be called from inside the declared rollout transition.
+
+\begin{description}[leftmargin=0.22\textwidth,style=nextline,itemsep=0.35em]
+    \item[\texttt{build\_initial\_state(...)}] Extract $X$, sizes, graph features, initial active pairs, initial metrics, and zero or warm-start duals from \texttt{cell\_features}, \texttt{pin\_features}, and \texttt{edge\_list}.
+    \item[\texttt{policy.sample(...)}] Return a full \texttt{PolicyAction}: ordering, residual flow, primal-dual controls, pair emphasis, temperature, and stop decision.
+    \item[\texttt{induce\_branches\_from\_global\_ordering(...)}] Convert sequence-pair or DAG ordering into antisymmetric $L/R/B/A$ labels for every active pair.
+    \item[\texttt{build\_constraints(...)}] Build signed branch, boundary, and density constraints with stable constraint IDs.
+    \item[\texttt{phr\_augmented\_lagrangian(...)}] Compute the PHR inequality augmented Lagrangian using signed constraints, active duals, and effective penalties.
+    \item[\texttt{primal\_dual\_transition(...)}] Run $K$ declared primal steps and return $X_{t+1}$.
+    \item[\texttt{phr\_dual\_update(...)}] Update active dual variables using the same constraint identities and effective penalties used by the primal step.
+    \item[\texttt{exact\_overlap\_audit(...)}] Return exact overlapping pairs when affordable; otherwise use an exact broad-phase/narrow-phase spatial hash and certify final candidates by full audit.
+    \item[\texttt{update\_active\_pairs(...)}] Retain hard pairs, insert missed pairs, sample near or uncertain pairs, and never mark pairs permanently safe.
+    \item[\texttt{score\_official\_metrics(...)}] Compute exact overlap ratio and normalized wirelength using repository-equivalent definitions.
+    \item[\texttt{select\_by\_exact\_overlap\_then\_wirelength(...)}] Select the lexicographically best saved candidate without modifying any candidate coordinates.
+\end{description}
+
+\subsection{Wisdom imported from the prior solver}
+
+The prior solver is not imported as runtime code. Its role is to identify robust lessons that become either training targets, constraints, logs, or ablations. The following mapping is allowed:
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.27\textwidth}Y}
+\toprule
+Prior-solver lesson & Implementation-safe translation \\
+\midrule
+Zero overlap dominates score & Checkpoint and final selection use exact overlap first, wirelength second. \\
+Temporary unlocks escape stuck layouts & Use soft-to-hard continuation and entropy to avoid premature branch commitment. Do not copy the unlock rule itself. \\
+Macro search changes basin & Use global sequence-pair or DAG ordering heads for macros/clusters. \\
+Local swaps reveal useful order changes & Distill final branch relations $d_{ij}^{\star}$, not named swap procedures. \\
+KD-tree/spatial pruning is necessary at scale & Use spatial hashing/exact audit for active-set discovery, not as a placement decision rule. \\
+Case gates improved measured results & Convert gates into ablations and teacher outcome labels; never use case IDs or gate names at inference. \\
+Legal projection made coordinates feasible & Use declared PHR constraints inside the Markov transition, not post-hoc projection. \\
+Proof machinery showed lower-bound gaps & Report that the learned method is not globally optimal; use exact metrics and optional lower-bound diagnostics only as evidence. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\callout{orange!80!black}{Teacher-transfer boundary}{The old solver may generate offline demonstrations and diagnostic labels. It may not appear in \texttt{placement.py}, Mode A, Mode B, the active transition, candidate selection, or post-rollout cleanup. If a run calls the teacher during evaluated inference, it is no longer a policy-conditioned primal-dual PPO run.}
+
+\subsection{Teacher dataset generation algorithm}
+
+\begin{lstlisting}[language=Python]
+def build_teacher_dataset(generator, teacher_solver, num_cases, quality_cfg):
+    dataset = []
+    for seed in range(num_cases):
+        G, cell_features, pin_features, edge_list = generator(seed)
+        X0 = cell_features[:, 2:4].clone()
+
+        # Offline only: never used by evaluated inference.
+        teacher_result = teacher_solver(cell_features, pin_features, edge_list)
+        X_star = teacher_result["final_cell_features"][:, 2:4]
+
+        exact_overlap, norm_wl = score_official_metrics(
+            X_star, cell_features, edge_list
+        )
+        if exact_overlap > quality_cfg.max_demo_overlap:
+            continue
+
+        branch_labels = extract_branch_labels(X_star, cell_features)
+        flow_target = clip(X_star - X0, -quality_cfg.max_flow, quality_cfg.max_flow)
+        active_pair_labels = extract_teacher_active_pairs(
+            X0, X_star, cell_features, edge_list
+        )
+        stop_label = float(exact_overlap == 0.0)
+        value_target = -(quality_cfg.lambda_o * exact_overlap +
+                         quality_cfg.lambda_w * norm_wl)
+
+        weight = exp(-quality_cfg.alpha_o * exact_overlap -
+                     quality_cfg.alpha_w * norm_wl)
+        dataset.append({
+            "G": G,
+            "X0": X0,
+            "X_star": X_star,
+            "branch_labels": branch_labels,
+            "flow_target": flow_target,
+            "active_pair_labels": active_pair_labels,
+            "stop_label": stop_label,
+            "value_target": value_target,
+            "weight": weight,
+            "metrics": {"overlap": exact_overlap, "wirelength": norm_wl},
+        })
+    return dataset
+\end{lstlisting}
+
+\subsection{Branch-label extraction}
+
+For each pair $(i,j)$ selected for teacher supervision, compute the most satisfied separation branch in the teacher geometry:
+\[
+    d_{ij}^{\star}=\arg\min_{d\in\Branch} c_{ij}(X_\star;d).
+\]
+The label is skipped if all four signed inequalities are close to zero within a numerical tolerance, because nearly tied branches can inject arbitrary ordering noise. A simple filter is
+\[
+    \min_{d_2\ne d_1}c_{ij}(X_\star;d_2)-c_{ij}(X_\star;d_1)\ge \epsilon_{\rm margin},
+\]
+where $d_1=\arg\min_d c_{ij}(X_\star;d)$. This prevents the policy from overfitting ambiguous teacher orderings.
+
+\subsection{PHR transition algorithm}
+
+\begin{lstlisting}[language=Python]
+def primal_dual_transition(X_base, duals, constraints, rho_eff, eta, alpha, K):
+    X = X_base.detach().clone().requires_grad_(True)
+    for _ in range(K):
+        L = phr_augmented_lagrangian(
+            X=X,
+            duals=duals,
+            constraints=constraints,
+            rho_eff=rho_eff,
+            eta=eta,
+            base=X_base,
+        )
+        grad = torch.autograd.grad(L, X, create_graph=False)[0]
+        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+        grad = torch.clamp(grad, min=-1e3, max=1e3)
+        X = (X - alpha * grad).detach().requires_grad_(True)
+    return X.detach()
+\end{lstlisting}
+
+The implementation must use the same signed constraints, constraint IDs, and effective penalties in the primal step, same-dual reward computation, and dual update. If any of these differ, the run fails the PHR consistency check.
+
+\subsection{Exact audit algorithm}
+
+\begin{lstlisting}[language=Python]
+def exact_overlap_audit(X, cell_features, force_all_pairs=False):
+    widths = cell_features[:, 4]
+    heights = cell_features[:, 5]
+    n = X.shape[0]
+
+    if force_all_pairs or n <= 4096:
+        candidate_pairs = all_pairs(n)
+    else:
+        candidate_pairs = spatial_hash_broad_phase(X, widths, heights)
+
+    missed = []
+    for i, j in candidate_pairs:
+        ox = 0.5 * (widths[i] + widths[j]) - abs(X[i, 0] - X[j, 0])
+        oy = 0.5 * (heights[i] + heights[j]) - abs(X[i, 1] - X[j, 1])
+        if ox > 0 and oy > 0:
+            missed.append((i, j))
+    return missed
+\end{lstlisting}
+
+Small tests must compare the spatial-hash audit with exhaustive all-pairs enumeration. Final Mode B candidates must use full exact scoring or a validated exact spatial-hash equivalent.
+
+\subsection{Training loop algorithm}
+
+\begin{lstlisting}[language=Python]
+def train_policy(cfg):
+    policy = load_or_initialize_policy(cfg)
+    if cfg.teacher_dataset is not None:
+        policy = outcome_distill(policy, cfg.teacher_dataset, cfg.distill)
+
+    tau_scheduler = MetricGatedTauScheduler(cfg)
+    ckpts = CheckpointManager(cfg)
+
+    for update in range(cfg.num_updates):
+        rollouts = collect_rollouts(
+            policy=policy,
+            tau=tau_scheduler.tau,
+            mode="training",
+            exact_audit=True,
+        )
+        advantages = compute_gae(rollouts)
+        ppo_update(policy, rollouts, advantages, cfg.ppo)
+
+        if update % cfg.validation_every == 0:
+            metrics = deterministic_validation(policy, cfg.validation)
+            tau_scheduler.update(metrics)
+            ckpts.maybe_save(policy, metrics)
+
+            if metrics.reward_mean > metrics.best_reward_seen and \
+               metrics.exact_overlap > metrics.best_overlap_seen:
+                mark_reward_misalignment(update, metrics)
+\end{lstlisting}
+
+\subsection{Default hyperparameter table}
+
+These values are recommended starting points, not claims of optimality. They should be logged in every run configuration.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.28\textwidth}p{0.18\textwidth}Y}
+\toprule
+Parameter & Default & Purpose \\
+\midrule
+PPO clip $\epsilon$ & $0.10$-$0.20$ & Stabilizes structured policy updates. \\
+GAE $\lambda$ & $0.90$-$0.97$ & Bias/variance tradeoff for long placement rollouts. \\
+Discount $\gamma$ & $0.98$-$0.995$ & Keeps terminal exact-overlap pressure relevant. \\
+Initial soft temperature $\tau_0$ & $1.5$-$2.0$ & Avoids early hard branch collapse. \\
+Minimum temperature $\tau_{\min}$ & $0.15$-$0.25$ & Allows hardening after exact-overlap progress. \\
+PHR steps $K_t$ & $4$-$32$ & Inner constrained transition budget. \\
+Penalty bounds $[\rho_{\min},\rho_{\max}]$ & $[10^{-3},10^3]$ & Prevents unstable dual pressure. \\
+Trust weight $\eta_t$ & learned, clipped & Keeps transition near policy base point. \\
+Active pair budget & problem-dependent & Controls scalable constraint coverage. \\
+Teacher max overlap & $0$ or small threshold & Filters weak demonstrations. \\
+Teacher anneal coefficient & exponential to zero & Prevents heuristic dependence. \\
+Validation horizon & match inference when possible & Avoids pessimistic short-horizon validation. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Required tests}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.28\textwidth}Y}
+\toprule
+Test & Passing condition \\
+\midrule
+Exact overlap parity & Exhaustive all-pairs audit matches spatial-hash audit on small cases. \\
+Branch antisymmetry & For every active pair, $D_{ji}=\operatorname{inv}(D_{ij})$. \\
+Relabeling invariance & Relabeling cells relabels branch outputs and final metrics without changing physical score. \\
+PHR identity consistency & Primal loss, same-dual reward, and dual update use identical constraint IDs and $\rho_{e,t}$. \\
+No teacher in inference & Static grep and runtime trace show no teacher-solver calls inside \texttt{placement.py}. \\
+Mode B no-repair & Candidate coordinates are identical before and after exact metric selection. \\
+Stop safety & False stops are logged and penalized; no nonzero-overlap stop is counted as success. \\
+Metric authority & Best model selected by exact overlap then wirelength, not shaped reward. \\
+Teacher annealing & $\lambda_{\rm teacher}$ reaches zero before reported final PPO evaluation. \\
+Large-case smoke & Active-pair memory and audit runtime remain bounded on the 2000-cell case. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Repository-Compatible Wrapper}
+
+\begin{lstlisting}[language=Python]
+def train_placement(cell_features, pin_features, edge_list,
+                    num_rollouts=4,
+                    num_steps=128,
+                    temperature=0.35,
+                    mode="audited_policy_ensemble",
+                    verbose=False,
+                    **kwargs):
+    candidates = []
+
+    for r in range(num_rollouts if mode == "audited_policy_ensemble" else 1):
+        state = build_initial_state(cell_features, pin_features, edge_list)
+        policy = load_policy_conditioned_pd_ppo()  # no teacher or heuristic calls at inference
+
+        for t in range(num_steps):
+            graph_state = build_graph_state(state)
+
+            action = policy.sample(graph_state, temperature=temperature)
+
+            branches = induce_branches_from_global_ordering(
+                action.macro_ordering,
+                action.cluster_ordering,
+                state.active_pairs,
+                state.memberships,
+            )
+
+            constraints = build_constraints(
+                state.X,
+                branches,
+                state.active_pairs,
+                outline=state.outline,
+                density_bins=state.density_bins,
+            )
+
+            X_base = state.X + action.step_scale * tanh(action.residual_flow)
+
+            L_before = phr_augmented_lagrangian(
+                state.X, state.duals, constraints,
+                rho=action.rho, eta=action.eta,
+                base=X_base,
+            )
+
+            X_next = primal_dual_transition(
+                X_base, state.duals, constraints,
+                rho=action.rho,
+                eta=action.eta,
+                alpha=action.alpha,
+                K=action.K,
+            )
+
+            L_after = phr_augmented_lagrangian(
+                X_next, state.duals, constraints,
+                rho=action.rho, eta=action.eta,
+                base=X_base,
+            )
+
+            reward = compute_reward_before_dual_update(
+                L_before, L_after, state, X_next, action
+            )
+
+            state.duals = phr_dual_update(
+                state.duals, constraints, X_next, rho=action.rho
+            )
+            state.duals = decay_inactive_branch_duals(state.duals, branches)
+
+            missed_pairs = exact_overlap_audit(X_next, cell_features)
+            state.active_pairs = update_active_pairs(
+                state.active_pairs, missed_pairs, X_next, action.pair_emphasis
+            )
+
+            state = state.with_new_centers(X_next)
+            state = state.with_reward_observation(reward)
+
+            if action.stop:
+                break
+
+        candidates.append(score_official_metrics(state.X, cell_features, edge_list))
+
+        if mode == "terminal_policy":
+            break
+
+    if mode == "terminal_policy":
+        X_final = candidates[-1].X
+    else:
+        X_final = select_by_exact_overlap_then_wirelength(candidates).X
+
+    final_cell_features = cell_features.clone()
+    final_cell_features[:, 2:4] = X_final.detach()
+    return {"final_cell_features": final_cell_features}
+\end{lstlisting}
+
+\Needspace{10\baselineskip}
+\section{Implementation Modules}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\ttfamily\footnotesize}p{0.22\textwidth}Y}
+teacher\_data.py & offline teacher dataset generation, teacher-metric filtering, branch-label extraction, residual-flow target extraction, and stop-label construction. \\
+distill.py & confidence-weighted outcome distillation, DAgger-style correction data, teacher-loss annealing, and warm-start checkpointing. \\
+policy.py & graph encoder; macro/cluster sequence-pair heads; membership head; residual-flow head; PD-control head; stop head; value head. \\
+ordering.py & Plackett--Luce, Gumbel-top-$k$, NeuralSort, Gumbel--Sinkhorn, or DAG ordering utilities. \\
+induce\_branches.py & sequence-pair/DAG to branch matrix; antisymmetry and acyclicity checks. \\
+constraints.py & signed branch constraints; boundary constraints; density constraints; smooth wirelength surrogate. \\
+primal\_dual.py & PHR inequality AL, primal coordinate steps, dual updates, inactive branch-dual decay. \\
+active\_set.py & exact spatial-hash audit, cutting-plane insertion, retention horizon, learned pair sampling. \\
+rollout.py & environment transitions, rewards, candidate cache, terminal/audited inference modes. \\
+ppo.py & group-normalized PPO, GAE, value loss, entropy/KL schedules. \\
+placement.py & stable public wrapper returning final cell centers. \\
+\end{tabularx}
+
+\end{center}
+
+\Needspace{12\baselineskip}
+\section{Run Validity Protocol}
+
+The architecture is only credible if the implementation obeys a strict run-validity protocol. The following rules are not optional documentation details; they define when a training run is methodologically valid.
+
+\subsection{Metric authority}
+
+The official metrics are the authority for checkpointing and final selection:
+\[
+    X^{\star}_{\rm eval}=\arg\min_{X\in\mathcal C_{\rm saved}}
+    \left(\ExactOv(X),\WireNorm(X)\right).
+\]
+The shaped reward, augmented-Lagrangian decrease, entropy, and PPO loss are training signals only. A checkpoint selected by shaped reward may be stored for debugging, but it must not overwrite the best exact-overlap or best lexicographic checkpoint. The implementation should therefore maintain at least
+\[
+\begin{gathered}
+    \texttt{best\_exact\_overlap.pt},\quad
+    \texttt{best\_lexicographic.pt},\\
+    \texttt{best\_wire\_given\_overlap\_threshold.pt},\quad
+    \texttt{latest.pt}.
+\end{gathered}
+\]
+If the reward improves while deterministic validation overlap worsens, the run is treated as reward misalignment, not as progress.
+
+\subsection{Teacher-distillation boundary}
+
+Offline demonstrations are permitted only before or during training. A valid run must prove that the evaluated policy does not call the teacher, does not use teacher gates, and does not repair candidates with teacher code. The teacher may provide labels
+\[
+    (d_{ij}^{\star},\Delta X^{\star},\Pset_{\rm teach}^{\star},b^{\star},V^{\star}),
+\]
+but the final transition still must be produced by the policy-conditioned primal-dual layer. The demonstration loss must be reported with an annealing coefficient $\lambda_{\rm teacher}(u)$, and final reported checkpoints must satisfy $\lambda_{\rm teacher}=0$ or be explicitly labeled as supervised warm-start checkpoints rather than final PPO models.
+
+\subsection{Active-set completeness}
+
+The active set is an efficient representation of constraints, not a claim that inactive pairs are safe. Let
+\[
+    M_t = \left|\Audit(X_t)\setminus \Pset_t\right|
+\]
+be the number of exact-overlap pairs discovered by audit that were not already active. The implementation must log $M_t$, the total active-pair count $|\Pset_t|$, the number of newly inserted cutting planes, and the retention age of hard pairs. A run is not ready to harden the ordering if $M_t$ remains high. Final candidates must receive a full exact-overlap audit, not just active-set scoring.
+
+\subsection{PHR and dual consistency}
+
+For every active constraint $e$, define the effective penalty
+\[
+    \rho_{e,t}=\operatorname{clip}(\rho_t\nu_{e,t},\rho_{\min},\rho_{\max}).
+\]
+The same $\rho_{e,t}$ and the same constraint identity $e$ must be used in the primal augmented-Lagrangian step, the same-dual reward computation, and the dual update:
+\[
+    \lambda_{e,t+1}=[\lambda_{e,t}+\rho_{e,t}g_e(X_{t+1})]_+.
+\]
+For branch constraints, the identity is $(i,j,d)$, not only $(i,j)$. If a branch changes, the old branch dual may decay, but it must not be silently reused as the multiplier for a different inequality. Unit tests should verify that the Lagrangian and the dual update reference identical constraint IDs and penalty values.
+
+\subsection{Soft-to-hard safety}
+
+Hardening is metric-gated, not update-gated. The temperature may decrease only when all three conditions hold:
+\[
+    \bar O_u < O_u^{\star}-\epsilon_O,
+    \qquad
+    \bar V_u \le V_{\max},
+    \qquad
+    \bar M_u \le M_{\max}.
+\]
+If deterministic exact overlap regresses for $p$ validation windows, the temperature is increased or held rather than forced lower. This prevents the policy from collapsing into a bad sequence-pair basin simply because a training schedule reached a nominal hardening stage.
+
+\subsection{Stop-policy safety}
+
+The stop head is a terminal decision, not a shortcut to collect shaped return. The implementation must log stop probability, stop rate, exact overlap at stop, and false-stop rate. If $\widehat O_t>O_{\rm stop}$, the stop logit is biased downward:
+\[
+    \ell_{t,{\rm gated}}^{\rm stop}
+    =\ell_t^{\rm stop}-\kappa_{\rm stop}\one\{\widehat O_t>O_{\rm stop}\}.
+\]
+Stopping with nonzero exact overlap is a failure event unless the training objective explicitly records it as an overlap-improving intermediate step. It must never be counted as a successful terminal placement.
+
+\subsection{Density and anti-collapse pressure}
+
+Density pressure is not a hidden legalization rule. It is an anti-collapse constraint that prevents wirelength from pulling all cells into a small region before pairwise non-overlap constraints have sufficient coverage. If no official outline exists, density constraints are soft training constraints and must be reported separately from benchmark legality. If density pressure is disabled, the ablation must report whether center collapse, missed pairs, and branch violations increase.
+
+\subsection{Structured-PPO ratio discipline}
+
+Group-normalized PPO ratios are an engineering stabilization for token-heavy structured actions. They are not a replacement for PPO accountability. The implementation must log per-group ratios, aggregate log-ratio, per-head KL, clipped-token fraction, entropy by head, and advantage variance. If group normalization changes the effective update too much, the run should be compared against a canonical aggregate-ratio baseline or a lower-variance staged-action baseline.
+
+\subsection{Mode B selection contract}
+
+Mode B is valid only if it is declared before evaluation and only selects among already-generated policy candidates. It may not move, legalize, repack, or polish candidates after rollout. Every saved candidate considered by Mode B must be scored by full exact overlap and normalized wirelength. Mode A must be reported as an ablation so the cost of ensemble selection is visible.
+
+\Needspace{10\baselineskip}
+\section{What Must Be Logged}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.25\textwidth}Y}
+Metric authority & Best exact-overlap checkpoint, best lexicographic checkpoint, best wirelength under overlap threshold, latest checkpoint, and shaped-reward debug checkpoint. \\
+Teacher transfer & Demonstration count, accepted demonstration quality, branch-imitation accuracy, residual-flow imitation error, active-pair recall, stop-label false-positive rate, DAgger correction count, and $\lambda_{\rm teacher}(u)$. \\
+Ordering consistency & Sequence-pair entropy, induced branch antisymmetry error, DAG acyclicity, permutation-equivariance sanity checks. \\
+Policy ownership & Residual-flow norm, policy-controlled $K_t$, $\rho_t$, $\eta_t$, $\alpha_t$, stop probability, and pressure distributions. \\
+Augmented Lagrangian & $\Lagr_t(X_t,\lambda_t;\Constraint_t)$ before/after transition using the same dual state, same constraint IDs, and same effective penalties $\rho_{e,t}$. \\
+Primal progress & Wirelength surrogate, signed branch violation, positive violation, boundary violation, density overflow, proximal movement. \\
+Dual pressure & Branch, boundary, and density multiplier histograms; inactive dual decay; stale-dual reactivation rates. \\
+Exact audit & Active-pair count, missed overlaps $M_t$, newly added cutting planes, retained hard pairs, hard-pair age, exact overlap ratio. \\
+Soft-to-hard safety & Temperature $\tau_u$, exact-overlap improvement indicator $I_u^O$, hardening predicate $H_u$, and hardening/softening event. \\
+Stop safety & Stop probability, stop rate, exact overlap at stop, false-stop count, and stop-logit gating frequency. \\
+PPO stability & Group ratios, aggregate log-ratio, clipped-token fraction, KL by action group, value loss, GAE variance, entropy by head. \\
+Final metrics & Official exact overlap, normalized wirelength, runtime, Mode A vs Mode B gap. \\
+\end{tabularx}
+\end{center}
+
+\Needspace{10\baselineskip}
+\section{Ablation Plan}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{navy}}p{0.24\textwidth}Y>{\RaggedLeft\arraybackslash}p{0.18\textwidth}}
+\toprule
+Variant & Question answered & Expected effect \\
+\midrule
+No teacher distillation & Does outcome pretraining improve sample efficiency and early overlap reduction? & Slower learning \\
+Rule-cloning teacher & Does cloning named heuristic gates overfit compared with outcome-only labels? & More brittleness \\
+No teacher annealing & Does persistent imitation prevent PPO from surpassing teacher basins? & Teacher bias \\
+Independent pair branches & Do local branch actions create cycles and weak credit assignment? & More inconsistency \\
+No sequence-pair hierarchy & Does global/hierarchical ordering matter for scaling? & Worse feasibility \\
+No residual coordinate flow & Does PPO need direct geometric proposal power? & Slower progress \\
+No PHR layer & Can raw stochastic flow alone reach exact non-overlap? & Residual overlaps \\
+No exact audit & Does the active set miss hidden conflicts? & Missed overlaps \\
+$c^+$-only AL & Does using only positive violation hurt dual behavior? & Hysteresis \\
+No density pressure & Does wirelength center-pull cause collapse? & More congestion \\
+Fixed $K,\rho,\alpha$ & Does policy-conditioned optimization control help? & Less adaptive \\
+Terminal policy only & What is the cost of ideological purity? & Lower robustness \\
+Audited ensemble & What is the gain from declared exact-metric selection? & Better benchmark score \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\Needspace{10\baselineskip}
+\section{Failure Modes and Safeguards}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\color{red!80!black}}p{0.24\textwidth}Y}
+Teacher bias & Distill only geometric outcomes, confidence-weight demonstrations, use DAgger-style correction, and anneal teacher loss to zero before final evaluation. \\
+Rule leakage & Audit the inference path to ensure no teacher gate, solver fallback, or post-rollout repair is called. \\
+Center collapse & Add density/anti-collapse constraints, entropy on ordering, and residual-flow spreading rewards. \\
+Ordering overcommitment & Use metric-gated soft-to-hard continuation, high initial entropy, and temperature reversal when exact overlap regresses. \\
+Stale branch duals & Store duals by pair/branch identity and decay inactive duals. \\
+PPO ratio explosion & Use group-normalized ratios and per-head KL monitoring; also log aggregate log-ratio. \\
+Hidden legalizer accusation & Keep the primal-dual layer inside the environment transition and report terminal-policy ablation. \\
+Active-set blind spots & Use exact spatial-hash audit, log $M_t$, never permanently mark pairs safe, and block hardening while missed pairs remain high. \\
+Metric mismatch & Treat shaped reward as diagnostic only; select checkpoints by deterministic exact overlap and lexicographic metrics. \\
+Stop leakage & Bias or mask stop while exact overlap is above threshold; report false-stop rate and exact overlap at stop. \\
+Mode B leakage & Declare Mode B before evaluation; select only among unmodified policy-generated candidates and full-audit every candidate. \\
+Wirelength degradation & Use lexicographic exact-overlap first, then normalized wirelength; log both at every checkpoint. \\
+\end{tabularx}
+\end{center}
+
+\Needspace{10\baselineskip}
+\section{Run Validity Checklist}
+
+A run should not be considered valid unless these checks pass:
+\begin{enumerate}
+    \item \textbf{Exact metric agreement.} The exact-overlap validator and the training exact-audit routine agree on small cases where all pairs can be enumerated.
+    \item \textbf{Metric authority.} The best model is selected by deterministic exact-overlap validation first and normalized wirelength second. The shaped-reward checkpoint is debug-only unless it is also best under official metrics.
+    \item \textbf{Teacher boundary.} Offline demonstrations are used only for pretraining or DAgger-style correction. The final inference path contains no teacher calls, no named heuristic gates, and no post-rollout repair.
+    \item \textbf{Outcome-only distillation.} The teacher loss supervises branch relations, residual flow, active-pair emphasis, stop labels, and value targets. It does not supervise case-specific gates, anchor choices, squeeze portfolios, or manual macro-search recipes.
+    \item \textbf{Teacher annealing.} The coefficient $\lambda_{\rm teacher}(u)$ is logged and reaches zero before final reported PPO evaluation.
+    \item \textbf{Full final audit.} Every final candidate considered by Mode B receives full exact-overlap and normalized-wirelength scoring.
+    \item \textbf{No post-rollout repair.} Returned candidates are never modified after the declared transition; they are only scored and selected.
+    \item \textbf{Branch consistency.} Sequence-pair branch induction is antisymmetric: $D_{ji}=\operatorname{inv}(D_{ij})$ for every active pair, and relabeling tests preserve the induced branch matrix.
+    \item \textbf{PHR consistency.} The primal Lagrangian, reward calculation, and dual update use the same constraint identities and the same effective penalties $\rho_{e,t}$.
+    \item \textbf{Branch-dual identity.} Branch duals are stored by $(i,j,d)$; inactive branch duals decay and are not reused for different active inequalities.
+    \item \textbf{Soft branch support.} Soft branch probabilities are epsilon-floored before the log-sum-exp relaxation so no branch becomes impossible too early.
+    \item \textbf{Metric-gated hardening.} Temperature decreases only when exact overlap improves, branch violation is low, and missed-pair count is low; hardening reverses or holds when exact overlap regresses.
+    \item \textbf{Stop safety.} Stop decisions with nonzero exact overlap are logged and penalized; stop-rate is reported against exact overlap at stop.
+    \item \textbf{Active-set completeness.} Missed pairs $M_t$, retained hard pairs, hard-pair age, and active-set size are logged; no pair is permanently declared safe.
+    \item \textbf{Density transparency.} Density and anti-collapse terms are reported separately from benchmark legality and ablated to test collapse risk.
+    \item \textbf{PPO accountability.} Group-normalized ratios are logged alongside aggregate log-ratio, per-head KL, clipped-token fraction, entropy, and advantage variance.
+    \item \textbf{Mode A/Mode B reporting.} A terminal-policy ablation is reported beside the audited ensemble mode, and Mode B is declared before evaluation.
+\end{enumerate}
+
+\Needspace{10\baselineskip}
+\section{Final Position}
+
+This is not pure coordinate-flow PPO, and it is not a conventional placer with a PPO wrapper. It is a policy-conditioned constrained dynamics system. PPO chooses the global combinatorial structure, stochastic region structure, residual motion, pressure schedule, primal-dual budget, active-set emphasis, temperature, and stop rule. The signed augmented Lagrangian layer executes the constrained geometry implied by those choices. Exact audits expose missing constraints and evaluate candidates, but they do not secretly repair the placement.
+
+\callout{purple!70!black}{Final summary}{The refined claim is precise: PPO owns the branch structure and optimization controls; the primal-dual layer owns the declared constrained transition. Offline teacher distillation is allowed only as an outcome-based warm start and must be annealed away before final evaluation. This is coherent because neither the optimizer nor the teacher is a post-hoc crutch. The run-validity protocol makes the claim falsifiable: if metric authority, teacher-boundary discipline, active-set completeness, PHR consistency, stop safety, and full exact final audit are not satisfied, the run is not considered valid.}
+
+\begin{thebibliography}{10}
+
+\bibitem{ross2011dagger}
+S. Ross, G. Gordon, and D. Bagnell,
+``A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning,''
+\emph{International Conference on Artificial Intelligence and Statistics}, 2011.
+
+\bibitem{schulman2017ppo}
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov,
+``Proximal Policy Optimization Algorithms,''
+\emph{arXiv:1707.06347}, 2017.
+
+\bibitem{achiam2017cpo}
+J. Achiam, D. Held, A. Tamar, and P. Abbeel,
+``Constrained Policy Optimization,''
+\emph{International Conference on Machine Learning}, 2017.
+
+\bibitem{bertsekas1999nonlinear}
+D. P. Bertsekas,
+\emph{Nonlinear Programming},
+Athena Scientific, 1999.
+
+\bibitem{nocedal2006numerical}
+J. Nocedal and S. J. Wright,
+\emph{Numerical Optimization},
+Springer, 2006.
+
+\bibitem{murata1996sequencepair}
+H. Murata, K. Fujiyoshi, S. Nakatake, and Y. Kajitani,
+``VLSI Module Placement Based on Rectangle-Packing by the Sequence-Pair,''
+\emph{IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems}, 1996.
+
+\bibitem{maddison2017concrete}
+C. J. Maddison, A. Mnih, and Y. W. Teh,
+``The Concrete Distribution: A Continuous Relaxation of Discrete Random Variables,''
+\emph{International Conference on Learning Representations}, 2017.
+
+\bibitem{jang2017gumbel}
+E. Jang, S. Gu, and B. Poole,
+``Categorical Reparameterization with Gumbel-Softmax,''
+\emph{International Conference on Learning Representations}, 2017.
+
+\bibitem{mena2018gumbelsinkhorn}
+G. Mena, D. Belanger, S. Linderman, and J. Snoek,
+``Learning Latent Permutations with Gumbel-Sinkhorn Networks,''
+\emph{International Conference on Learning Representations}, 2018.
+
+\bibitem{grover2019neuralsort}
+A. Grover, E. Wang, A. Zweig, and S. Ermon,
+``Stochastic Optimization of Sorting Networks via Continuous Relaxations,''
+\emph{International Conference on Learning Representations}, 2019.
+
+\bibitem{lin2021dreamplace}
+Y. Lin et al.,
+``DREAMPlace: Deep Learning Toolkit-Enabled GPU Acceleration for Modern VLSI Placement,''
+\emph{IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems}, 2021.
+
+\end{thebibliography}
+
+\end{document}
