@@ -522,7 +522,10 @@ def main():
             record["hardening_best_overlap"] = hardening_state["best_overlap"]
             record["hardening_bad_windows"] = hardening_state["bad_windows"]
             record["hardening_source"] = hardening_source
-        record["checkpoint_metric_source"] = "validation" if validation else "training"
+        authority_metrics_available = validation is not None or args.validation_interval <= 0
+        record["checkpoint_metric_source"] = (
+            "validation" if validation else ("training_fallback" if args.validation_interval <= 0 else "held")
+        )
         record["checkpoint_metric_overlap"] = record.get("validation_overlap", avg_overlap)
         record["checkpoint_metric_wirelength"] = record.get("validation_wirelength", avg_wl)
         with open(log_path, "a", encoding="utf-8") as handle:
@@ -539,16 +542,16 @@ def main():
             best_reward = avg_reward
             save_policy_checkpoint(policy, checkpoint_dir / "shaped_reward_debug.pt", config=vars(args), stats=record)
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_reward.pt", config=vars(args), stats=record)
-        if metric_overlap < best_exact_overlap:
+        if authority_metrics_available and metric_overlap < best_exact_overlap:
             best_exact_overlap = metric_overlap
             save_policy_checkpoint(policy, checkpoint_dir / "best_exact_overlap.pt", config=vars(args), stats=record)
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_overlap.pt", config=vars(args), stats=record)
-        if (metric_overlap, metric_wl) < (best_lex_overlap, best_lex_wl):
+        if authority_metrics_available and (metric_overlap, metric_wl) < (best_lex_overlap, best_lex_wl):
             best_lex_overlap, best_lex_wl = metric_overlap, metric_wl
             save_policy_checkpoint(policy, checkpoint_dir / "best_lexicographic.pt", config=vars(args), stats=record)
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_validation.pt", config=vars(args), stats=record)
             save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy.pt", config=vars(args), stats=record)
-        if metric_overlap <= args.wire_overlap_threshold and metric_wl < best_wire_under_threshold:
+        if authority_metrics_available and metric_overlap <= args.wire_overlap_threshold and metric_wl < best_wire_under_threshold:
             best_wire_under_threshold = metric_wl
             save_policy_checkpoint(policy, checkpoint_dir / "best_wire_given_overlap_threshold.pt", config=vars(args), stats=record)
 
