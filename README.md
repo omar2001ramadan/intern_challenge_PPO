@@ -60,3 +60,21 @@ We will review submissions on a rolling basis.
 > Insert a new row in the table above with your name, overlap, wirelength, and any notes. Ensure you sort by overlap.
 
 Good luck!
+
+## Policy-Conditioned PPO Implementation
+
+This fork includes a policy-conditioned primal-dual PPO path and an offline
+teacher-distillation path:
+
+- `train_ppo.py` trains the structured PPO policy. Add `--teacher-dataset path.pt`
+  with `--distill-epochs N` to warm-start from offline outcome demonstrations
+  before PPO begins.
+- `teacher_data.py` builds offline outcome datasets from a teacher solver. By
+  default it disables policy inference while the teacher is running so the
+  teacher remains an offline demonstration source.
+- `distill.py` performs confidence-weighted outcome distillation from saved
+  teacher data. It trains branch relations, residual flow, active-pair emphasis,
+  stop behavior, and value targets, then logs `teacher_lambda=0` during PPO.
+- `validity_tests.py` runs lightweight validity checks for exact audit parity,
+  branch antisymmetry, no-teacher inference, Mode B no-repair selection, stop
+  safety, teacher annealing, active-set scale, and distillation smoke coverage.

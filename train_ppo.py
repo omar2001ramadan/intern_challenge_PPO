@@ -273,6 +273,11 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=25)
     parser.add_argument("--validation-episodes", type=int, default=4)
     parser.add_argument("--resume-checkpoint", default="")
+    parser.add_argument("--teacher-dataset", default="")
+    parser.add_argument("--distill-epochs", type=int, default=0)
+    parser.add_argument("--distill-batch-size", type=int, default=1)
+    parser.add_argument("--distill-lr", type=float, default=1e-4)
+    parser.add_argument("--distill-max-branch-pairs", type=int, default=65_536)
     parser.add_argument("--lag-reward-coef", type=float, default=1.0)
     parser.add_argument("--overlap-reward-coef", type=float, default=4.0)
     parser.add_argument("--overlap-regression-coef", type=float, default=16.0)
@@ -343,12 +348,37 @@ def main():
             num_clusters=args.num_clusters,
             global_flow_rank=args.global_flow_rank,
         ).to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_path = Path(args.log)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    distill_stats = {"teacher_samples": 0, "teacher_lambda_final": 0.0, "dagger_correction_count": 0}
+    if args.teacher_dataset:
+        from distill import DistillConfig, load_teacher_dataset, outcome_distill
+
+        dataset = load_teacher_dataset(args.teacher_dataset)
+        distill_cfg = DistillConfig(
+            epochs=max(int(args.distill_epochs), 1),
+            batch_size=args.distill_batch_size,
+            lr=args.distill_lr,
+            max_branch_pairs_per_sample=args.distill_max_branch_pairs,
+            relaxation=args.relaxation,
+            soft_tau=args.soft_tau_start,
+            seed=args.seed,
+        )
+        distill_stats = outcome_distill(policy, dataset, distill_cfg, device=device)
+        save_policy_checkpoint(
+            policy,
+            checkpoint_dir / "outcome_distilled_warmstart.pt",
+            config={"distill": distill_cfg.__dict__, "train": vars(args)},
+            stats=distill_stats,
+        )
+        with open(checkpoint_dir / "outcome_distill_stats.json", "w", encoding="utf-8") as handle:
+            json.dump(distill_stats, handle, sort_keys=True, indent=2)
+
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
     best_exact_overlap = float("inf")
     best_lex_overlap = float("inf")
@@ -436,6 +466,13 @@ def main():
             "soft_tau": soft_tau,
             "soft_relaxation": use_soft,
             "relaxation": args.relaxation,
+            "teacher_dataset": bool(args.teacher_dataset),
+            "teacher_samples": distill_stats.get("teacher_samples", 0),
+            "teacher_lambda": 0.0,
+            "dagger_correction_count": distill_stats.get("dagger_correction_count", 0),
+            "distill_branch_accuracy": distill_stats.get("branch_accuracy", 0.0),
+            "distill_flow_loss": distill_stats.get("flow_loss", 0.0),
+            "distill_stop_false_positive": distill_stats.get("stop_false_positive", 0.0),
             "ordering_representation": args.ordering_representation,
             "branch_mode": args.branch_mode,
             "al_mode": args.al_mode,
