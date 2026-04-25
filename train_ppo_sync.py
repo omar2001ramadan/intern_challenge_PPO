@@ -1,6 +1,7 @@
 """Synchronized multi-GPU PPO for sequence-pair ordering policies."""
 
 import argparse
+import datetime
 import json
 import os
 import random
@@ -42,7 +43,12 @@ def worker(local_rank, world_size, args):
 
     os.environ.setdefault("MASTER_ADDR", args.master_addr)
     os.environ.setdefault("MASTER_PORT", str(args.master_port))
-    dist.init_process_group(backend=backend, rank=local_rank, world_size=world_size)
+    dist.init_process_group(
+        backend=backend,
+        rank=local_rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(minutes=args.dist_timeout_minutes),
+    )
 
     random.seed(args.seed + local_rank)
     torch.manual_seed(args.seed)
@@ -90,6 +96,9 @@ def worker(local_rank, world_size, args):
         episode_infos = []
         for episode_idx in range(args.episodes_per_rank):
             seed = args.seed + update_idx * 100_000 + local_rank * 10_000 + episode_idx
+            forced_size = None
+            if not args.random_rank_sizes:
+                forced_size = sizes[(update_idx * args.episodes_per_rank + episode_idx) % len(sizes)]
             episode_transitions, info = collect_episode(
                 policy,
                 sizes,
@@ -99,6 +108,7 @@ def worker(local_rank, world_size, args):
                 temperature,
                 soft_tau=soft_tau,
                 relaxation=args.relaxation,
+                forced_size=forced_size,
             )
             transitions.extend(episode_transitions)
             episode_infos.append(info)
@@ -179,6 +189,7 @@ def worker(local_rank, world_size, args):
                 "temperature": temperature,
                 "soft_tau": soft_tau,
                 "soft_relaxation": use_soft,
+                "random_rank_sizes": args.random_rank_sizes,
                 "relaxation": args.relaxation,
                 "ordering_representation": args.ordering_representation,
                 "branch_mode": args.branch_mode,
@@ -259,6 +270,12 @@ def main():
     parser.add_argument("--log", default="training_logs/ppo_sync.jsonl")
     parser.add_argument("--master-addr", default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29571)
+    parser.add_argument("--dist-timeout-minutes", type=int, default=60)
+    parser.add_argument(
+        "--random-rank-sizes",
+        action="store_true",
+        help="Let each rank sample problem sizes independently. Disabled by default to avoid sync rank skew.",
+    )
     args = parser.parse_args()
 
     gpu_ids = [item.strip() for item in args.gpus.split(",") if item.strip()]

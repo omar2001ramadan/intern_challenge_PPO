@@ -56,16 +56,26 @@ def soft_tau_at(update_idx, total_updates, start=2.0, end=0.10):
     return linear_schedule(update_idx, total_updates, start, end)
 
 
-def make_problem(sizes, device, seed):
-    num_macros, num_std_cells = random.choice(sizes)
+def make_problem(sizes, device, seed, forced_size=None):
+    num_macros, num_std_cells = forced_size if forced_size is not None else random.choice(sizes)
     torch.manual_seed(seed)
     cell_features, pin_features, edge_list = generate_placement_input(num_macros, num_std_cells)
     cell_features = initialize_random_spread(cell_features, seed=seed + 17)
     return cell_features.to(device), pin_features.to(device), edge_list.to(device), (num_macros, num_std_cells)
 
 
-def collect_episode(policy, sizes, env_config, device, seed, temperature, soft_tau=None, relaxation="sigmoid"):
-    cell_features, pin_features, edge_list, size = make_problem(sizes, device, seed)
+def collect_episode(
+    policy,
+    sizes,
+    env_config,
+    device,
+    seed,
+    temperature,
+    soft_tau=None,
+    relaxation="sigmoid",
+    forced_size=None,
+):
+    cell_features, pin_features, edge_list, size = make_problem(sizes, device, seed, forced_size=forced_size)
     env = PlacementOrderingEnv(cell_features, pin_features, edge_list, env_config)
     transitions = []
     infos = []
