@@ -15,7 +15,16 @@ import torch.multiprocessing as mp
 from env import EnvConfig
 from ordering_policy import OrderingPolicy, load_policy_checkpoint, save_policy_checkpoint
 from ppo import ppo_update
-from train_ppo import collect_episode, parse_sizes, soft_tau_at, temperature_at, update_metric_gated_tau, validate_policy
+from train_ppo import (
+    build_teacher_transfer_record,
+    collect_episode,
+    mean_numeric_dicts,
+    parse_sizes,
+    soft_tau_at,
+    temperature_at,
+    update_metric_gated_tau,
+    validate_policy,
+)
 
 
 def broadcast_parameters(module, src=0):
@@ -80,6 +89,7 @@ def worker(local_rank, world_size, args):
         audit_pressure_gamma=args.audit_pressure_gamma,
         audit_pressure_max=args.audit_pressure_max,
     )
+    _checkpoint = {}
     if args.resume_checkpoint:
         policy, _checkpoint = load_policy_checkpoint(args.resume_checkpoint, device)
     else:
@@ -89,14 +99,100 @@ def worker(local_rank, world_size, args):
             num_clusters=args.num_clusters,
             global_flow_rank=args.global_flow_rank,
         ).to(device)
-    broadcast_parameters(policy, src=0)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
     checkpoint_dir = Path(args.checkpoint_dir)
     log_path = Path(args.log)
     if local_rank == 0:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+    resume_update_offset = int(_checkpoint.get("stats", {}).get("update", -1)) + 1 if isinstance(_checkpoint, dict) else 0
+
+    teacher_dataset_path = args.teacher_dataset
+    if not teacher_dataset_path and isinstance(_checkpoint, dict):
+        resumed_teacher_path = _checkpoint.get("config", {}).get("teacher_dataset_path", "")
+        if resumed_teacher_path and os.path.exists(resumed_teacher_path):
+            teacher_dataset_path = resumed_teacher_path
+    teacher_metadata = {}
+    teacher_dataset_version = 0
+    teacher_dataset = []
+    teacher_distill_cfg = None
+    distill_stats = {
+        "teacher_samples": 0,
+        "teacher_lambda_initial": 0.0,
+        "teacher_lambda_final": 0.0,
+        "dagger_correction_count": 0,
+    }
+    if teacher_dataset_path:
+        from distill import DistillConfig, outcome_distill, teacher_auxiliary_update, teacher_lambda_at
+        from teacher_data import load_teacher_dataset_payload
+
+        dataset_payload = load_teacher_dataset_payload(teacher_dataset_path)
+        teacher_dataset = list(dataset_payload["samples"])
+        teacher_metadata = dict(dataset_payload.get("metadata", {}))
+        teacher_dataset_version = int(dataset_payload.get("version", 0))
+        teacher_distill_cfg = DistillConfig(
+            epochs=max(int(args.distill_epochs), 1),
+            batch_size=args.distill_batch_size,
+            lr=args.distill_lr,
+            max_branch_pairs_per_sample=args.distill_max_branch_pairs,
+            relaxation=args.relaxation,
+            soft_tau=args.soft_tau_start,
+            teacher_aux_lr_scale=args.teacher_aux_lr_scale,
+            teacher_aux_loss_cap=args.teacher_aux_loss_cap,
+            teacher_aux_weight_cap=args.teacher_aux_weight_cap,
+            seed=args.seed,
+        )
+        if args.teacher_dataset and local_rank == 0:
+            distill_stats = outcome_distill(policy, teacher_dataset, teacher_distill_cfg, device=device)
+            save_policy_checkpoint(
+                policy,
+                checkpoint_dir / "outcome_distilled_warmstart.pt",
+                config={
+                    "distill": teacher_distill_cfg.__dict__,
+                    "teacher_dataset_path": teacher_dataset_path,
+                    "teacher_dataset_version": teacher_dataset_version,
+                    "teacher_metadata": teacher_metadata,
+                    "train": vars(args),
+                },
+                stats=distill_stats,
+            )
+            with open(checkpoint_dir / "outcome_distill_stats.json", "w", encoding="utf-8") as handle:
+                json.dump(distill_stats, handle, sort_keys=True, indent=2)
+            with open(checkpoint_dir / "teacher_transfer_manifest.json", "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "teacher_dataset_path": teacher_dataset_path,
+                        "teacher_dataset_version": teacher_dataset_version,
+                        "teacher_metadata": teacher_metadata,
+                        "distill_stats": distill_stats,
+                    },
+                    handle,
+                    sort_keys=True,
+                    indent=2,
+                )
+        elif isinstance(_checkpoint, dict):
+            resume_stats = _checkpoint.get("stats", {})
+            for key in ("teacher_samples", "teacher_lambda_initial", "teacher_lambda_final", "dagger_correction_count"):
+                if key in resume_stats:
+                    distill_stats[key] = resume_stats[key]
+        dist.barrier()
+    elif isinstance(_checkpoint, dict):
+        resume_stats = _checkpoint.get("stats", {})
+        for key in ("teacher_samples", "teacher_lambda_initial", "teacher_lambda_final", "dagger_correction_count"):
+            if key in resume_stats:
+                distill_stats[key] = resume_stats[key]
+        teacher_metadata = _checkpoint.get("config", {}).get("teacher_metadata", {})
+        teacher_dataset_version = int(_checkpoint.get("config", {}).get("teacher_dataset_version", 0) or 0)
+
+    broadcast_parameters(policy, src=0)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    checkpoint_config = {
+        **vars(args),
+        "teacher_dataset_path": teacher_dataset_path,
+        "teacher_dataset_version": teacher_dataset_version,
+        "teacher_metadata": teacher_metadata,
+    }
 
     best_exact_overlap = float("inf")
     best_lex_overlap = float("inf")
@@ -147,6 +243,29 @@ def worker(local_rank, world_size, args):
             sync_gradients=True,
             equivariance_coef=args.equivariance_coef,
         )
+        teacher_lambda_current = 0.0
+        teacher_aux_stats = {}
+        if teacher_dataset and teacher_distill_cfg is not None:
+            teacher_lambda_current = teacher_lambda_at(
+                resume_update_offset + update_idx,
+                lambda0=args.teacher_lambda0,
+                anneal_updates=args.teacher_anneal_updates,
+            )
+            aux_rows = []
+            for aux_step in range(max(int(args.teacher_aux_steps_per_update), 0)):
+                aux_rows.append(
+                    teacher_auxiliary_update(
+                        policy,
+                        teacher_dataset,
+                        teacher_distill_cfg,
+                        optimizer=optimizer,
+                        lambda_teacher=teacher_lambda_current,
+                        batch_size=args.teacher_aux_batch_size,
+                        device=device,
+                        seed=args.seed + (resume_update_offset + update_idx) * 10_000 + aux_step,
+                    )
+                )
+            teacher_aux_stats = mean_numeric_dicts(aux_rows)
 
         local_overlap = sum(info["best_overlap"] for info in episode_infos) / len(episode_infos)
         local_wl = sum(info["best_wl"] for info in episode_infos) / len(episode_infos)
@@ -188,6 +307,9 @@ def worker(local_rank, world_size, args):
         local_overlap_delta = sum(info.get("overlap_delta", 0.0) for info in episode_infos) / len(episode_infos)
         local_branch_penalty = sum(info.get("branch_violation_penalty", 0.0) for info in episode_infos) / len(episode_infos)
         local_missed_penalty = sum(info.get("missed_pair_penalty", 0.0) for info in episode_infos) / len(episode_infos)
+        reduced_teacher_aux_stats = {
+            key: reduce_mean(value, device) for key, value in teacher_aux_stats.items()
+        }
         avg_overlap = reduce_mean(local_overlap, device)
         avg_wl = reduce_mean(local_wl, device)
         avg_reward = reduce_mean(local_reward, device)
@@ -288,8 +410,18 @@ def worker(local_rank, world_size, args):
                 "avg_branch_violation_penalty": avg_branch_penalty,
                 "avg_missed_pair_penalty": avg_missed_penalty,
                 "elapsed": time.time() - started,
+                **build_teacher_transfer_record(
+                    args,
+                    distill_stats,
+                    teacher_metadata,
+                    dataset_path=teacher_dataset_path,
+                    dataset_version=teacher_dataset_version,
+                    teacher_lambda=teacher_lambda_current,
+                ),
                 **metrics,
             }
+            record.update(reduced_teacher_aux_stats)
+            record["teacher_update_index"] = resume_update_offset + update_idx
             validation = None
             if args.validation_interval > 0 and update_idx % args.validation_interval == 0:
                 validation = validate_policy(
@@ -306,10 +438,18 @@ def worker(local_rank, world_size, args):
                 record.update(validation)
             if args.metric_gated_hardening:
                 hardening_source = "hold"
+                hardening_overlap_improved = False
+                hardening_stable = False
                 if validation is not None:
                     gate_overlap = record["validation_overlap"]
                     gate_branch = record["validation_branch_violation"]
                     gate_missed = record["validation_missed_pairs"]
+                    prior_best_overlap = hardening_state["best_overlap"]
+                    hardening_overlap_improved = gate_overlap < prior_best_overlap - args.hardening_overlap_eps
+                    hardening_stable = (
+                        gate_branch <= args.hardening_branch_vmax
+                        and gate_missed <= args.hardening_missed_max
+                    )
                     hardening_source = "validation"
                     soft_tau_state = update_metric_gated_tau(
                         soft_tau_state,
@@ -330,10 +470,18 @@ def worker(local_rank, world_size, args):
                 record["hardening_best_overlap"] = hardening_state["best_overlap"]
                 record["hardening_bad_windows"] = hardening_state["bad_windows"]
                 record["hardening_source"] = hardening_source
+                record["hardening_overlap_improved"] = hardening_overlap_improved
+                record["hardening_stable"] = hardening_stable
             authority_metrics_available = validation is not None
             record["checkpoint_metric_source"] = "validation" if validation else "held"
             record["checkpoint_metric_overlap"] = record.get("validation_overlap")
             record["checkpoint_metric_wirelength"] = record.get("validation_wirelength")
+            record["reward_misaligned"] = bool(
+                authority_metrics_available
+                and avg_reward > best_reward
+                and record["checkpoint_metric_overlap"] is not None
+                and record["checkpoint_metric_overlap"] > best_exact_overlap
+            )
             with open(log_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
             print(json.dumps(record, sort_keys=True), flush=True)
@@ -341,24 +489,24 @@ def worker(local_rank, world_size, args):
             metric_overlap = record["checkpoint_metric_overlap"]
             metric_wl = record["checkpoint_metric_wirelength"]
 
-            save_policy_checkpoint(policy, checkpoint_dir / "latest.pt", config=vars(args), stats=record)
-            save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_latest.pt", config=vars(args), stats=record)
+            save_policy_checkpoint(policy, checkpoint_dir / "latest.pt", config=checkpoint_config, stats=record)
+            save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_latest.pt", config=checkpoint_config, stats=record)
             if avg_reward > best_reward:
                 best_reward = avg_reward
-                save_policy_checkpoint(policy, checkpoint_dir / "shaped_reward_debug.pt", config=vars(args), stats=record)
-                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_reward.pt", config=vars(args), stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "shaped_reward_debug.pt", config=checkpoint_config, stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_reward.pt", config=checkpoint_config, stats=record)
             if authority_metrics_available and metric_overlap < best_exact_overlap:
                 best_exact_overlap = metric_overlap
-                save_policy_checkpoint(policy, checkpoint_dir / "best_exact_overlap.pt", config=vars(args), stats=record)
-                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_overlap.pt", config=vars(args), stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "best_exact_overlap.pt", config=checkpoint_config, stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_overlap.pt", config=checkpoint_config, stats=record)
             if authority_metrics_available and (metric_overlap, metric_wl) < (best_lex_overlap, best_lex_wl):
                 best_lex_overlap, best_lex_wl = metric_overlap, metric_wl
-                save_policy_checkpoint(policy, checkpoint_dir / "best_lexicographic.pt", config=vars(args), stats=record)
-                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_validation.pt", config=vars(args), stats=record)
-                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy.pt", config=vars(args), stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "best_lexicographic.pt", config=checkpoint_config, stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy_best_validation.pt", config=checkpoint_config, stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "ordering_policy.pt", config=checkpoint_config, stats=record)
             if authority_metrics_available and metric_overlap <= args.wire_overlap_threshold and metric_wl < best_wire_under_threshold:
                 best_wire_under_threshold = metric_wl
-                save_policy_checkpoint(policy, checkpoint_dir / "best_wire_given_overlap_threshold.pt", config=vars(args), stats=record)
+                save_policy_checkpoint(policy, checkpoint_dir / "best_wire_given_overlap_threshold.pt", config=checkpoint_config, stats=record)
 
         if args.metric_gated_hardening:
             state_tensor = torch.tensor(
@@ -408,6 +556,18 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=25)
     parser.add_argument("--validation-episodes", type=int, default=4)
     parser.add_argument("--resume-checkpoint", default="")
+    parser.add_argument("--teacher-dataset", default="")
+    parser.add_argument("--distill-epochs", type=int, default=0)
+    parser.add_argument("--distill-batch-size", type=int, default=1)
+    parser.add_argument("--distill-lr", type=float, default=1e-4)
+    parser.add_argument("--distill-max-branch-pairs", type=int, default=65_536)
+    parser.add_argument("--teacher-lambda0", type=float, default=1.0)
+    parser.add_argument("--teacher-anneal-updates", type=int, default=50)
+    parser.add_argument("--teacher-aux-batch-size", type=int, default=1)
+    parser.add_argument("--teacher-aux-steps-per-update", type=int, default=1)
+    parser.add_argument("--teacher-aux-lr-scale", type=float, default=0.10)
+    parser.add_argument("--teacher-aux-loss-cap", type=float, default=256.0)
+    parser.add_argument("--teacher-aux-weight-cap", type=float, default=0.25)
     parser.add_argument("--lag-reward-coef", type=float, default=1.0)
     parser.add_argument("--overlap-reward-coef", type=float, default=4.0)
     parser.add_argument("--overlap-regression-coef", type=float, default=16.0)

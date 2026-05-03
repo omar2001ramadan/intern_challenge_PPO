@@ -15,7 +15,36 @@ def canonicalize_pairs(pairs):
     pairs = pairs[pairs[:, 0] != pairs[:, 1]]
     if pairs.numel() == 0:
         return pairs.reshape(0, 2).long()
-    return torch.unique(pairs.long(), dim=0)
+    pairs = pairs.long()
+    keys = pair_sort_keys(pairs)
+    order = torch.argsort(keys)
+    pairs = pairs[order]
+    keys = keys[order]
+    unique_mask = torch.ones_like(keys, dtype=torch.bool)
+    unique_mask[1:] = keys[1:] != keys[:-1]
+    return pairs[unique_mask]
+
+
+def pair_sort_keys(pairs, base=None):
+    """Encode unordered pairs into sortable integer keys."""
+    if pairs.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=pairs.device)
+    if base is None:
+        base = int(torch.max(pairs).item()) + 1
+    return pairs[:, 0].long() * int(base) + pairs[:, 1].long()
+
+
+def sort_pairs_and_payload(pairs, *payloads, base=None):
+    """Sort unique pairs lexicographically and apply the same permutation to payloads."""
+    if pairs.numel() == 0:
+        outputs = [pairs.reshape(0, 2).long()]
+        outputs.extend(payload[:0] for payload in payloads)
+        return tuple(outputs)
+    keys = pair_sort_keys(pairs, base=base)
+    order = torch.argsort(keys)
+    outputs = [pairs[order]]
+    outputs.extend(payload[order] for payload in payloads)
+    return tuple(outputs)
 
 
 def connected_cell_pairs(pin_features, edge_list, device=None, max_pairs=500_000):
@@ -122,8 +151,8 @@ def update_active_pair_cache(
         pair_ages = torch.clamp(pair_ages.to(active_pairs.device) - 1, min=0)
 
     keep = pair_ages > 0
-    kept_pairs = active_pairs[keep]
-    kept_ages = pair_ages[keep]
+    kept_pairs = active_pairs[keep].reshape(-1, 2).long()
+    kept_ages = pair_ages[keep].reshape(-1).long()
 
     missed_pairs = canonicalize_pairs(missed_pairs)
     if missed_pairs.numel() == 0:
@@ -132,17 +161,54 @@ def update_active_pair_cache(
             kept_ages = kept_ages[:max_pairs]
         return kept_pairs, kept_ages
 
-    age_map = {tuple(pair): int(age) for pair, age in zip(kept_pairs.detach().cpu().tolist(), kept_ages.detach().cpu().tolist())}
-    for pair in missed_pairs.detach().cpu().tolist():
-        age_map[tuple(pair)] = int(retention_horizon)
+    if kept_pairs.numel() == 0:
+        ages = torch.full(
+            (missed_pairs.shape[0],),
+            int(retention_horizon),
+            dtype=torch.long,
+            device=missed_pairs.device,
+        )
+        pairs, ages = sort_pairs_and_payload(missed_pairs, ages)
+    else:
+        base = int(torch.max(torch.cat([kept_pairs.reshape(-1), missed_pairs.reshape(-1)])).item()) + 1
+        kept_pairs, kept_ages = sort_pairs_and_payload(kept_pairs, kept_ages, base=base)
+        missed_pairs = sort_pairs_and_payload(missed_pairs, base=base)[0]
+        kept_keys = pair_sort_keys(kept_pairs, base=base)
+        missed_keys = pair_sort_keys(missed_pairs, base=base)
 
-    pairs = torch.tensor(list(age_map.keys()), dtype=torch.long, device=active_pairs.device)
-    ages = torch.tensor(list(age_map.values()), dtype=torch.long, device=active_pairs.device)
+        insert_positions = torch.searchsorted(kept_keys, missed_keys)
+        if kept_keys.numel() > 0:
+            clamped = torch.clamp(insert_positions, max=kept_keys.shape[0] - 1)
+            matched = (insert_positions < kept_keys.shape[0]) & (kept_keys[clamped] == missed_keys)
+        else:
+            matched = torch.zeros_like(insert_positions, dtype=torch.bool)
+
+        if torch.any(matched):
+            kept_ages[insert_positions[matched]] = torch.maximum(
+                kept_ages[insert_positions[matched]],
+                torch.full_like(insert_positions[matched], int(retention_horizon), dtype=torch.long),
+            )
+
+        new_pairs = missed_pairs[~matched]
+        if new_pairs.numel() == 0:
+            pairs, ages = kept_pairs, kept_ages
+        else:
+            new_ages = torch.full(
+                (new_pairs.shape[0],),
+                int(retention_horizon),
+                dtype=torch.long,
+                device=new_pairs.device,
+            )
+            pairs = torch.cat([kept_pairs, new_pairs], dim=0)
+            ages = torch.cat([kept_ages, new_ages], dim=0)
+            pairs, ages = sort_pairs_and_payload(pairs, ages, base=base)
+
     if pairs.shape[0] > max_pairs:
-        order = torch.argsort(ages, descending=True)[:max_pairs]
-        pairs = pairs[order]
-        ages = ages[order]
-    pairs = canonicalize_pairs(pairs)
-    if pairs.shape[0] != ages.shape[0]:
-        ages = torch.full((pairs.shape[0],), int(retention_horizon), dtype=torch.long, device=pairs.device)
+        base = int(torch.max(pairs).item()) + 1
+        keys = pair_sort_keys(pairs, base=base)
+        priority = (int(retention_horizon) + 1 - ages.long()) * int(base * base + 1) + keys
+        keep_order = torch.argsort(priority)[:max_pairs]
+        pairs = pairs[keep_order]
+        ages = ages[keep_order]
+        pairs, ages = sort_pairs_and_payload(pairs, ages, base=base)
     return pairs, ages

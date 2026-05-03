@@ -96,6 +96,7 @@ def main():
             str(checkpoint_dir),
             "--log",
             str(log_path),
+            "--metric-gated-hardening",
             *VARIANTS[variant],
         ]
         subprocess.run(command, check=True)

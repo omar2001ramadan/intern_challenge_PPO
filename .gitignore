@@ -9,3 +9,6 @@
 
 training_logs*/
 checkpoints*/
+runs/
+traces/
+.DS_Store

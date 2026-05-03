@@ -8,17 +8,16 @@ import torch
 
 from env import EnvConfig, PlacementOrderingEnv
 from ordering_policy import hierarchical_active_branch_weights, load_policy_checkpoint
+from rollout import select_by_exact_overlap_then_wirelength
 from validate_policy import make_case, parse_cases
 
 
-def candidate_key(item):
-    score = item[0]
-    return (
-        score["overlap_cells"],
-        score["overlap_ratio"],
-        score["normalized_wl"],
-        score["num_overlap_pairs"],
-    )
+def default_device_arg():
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
 
 
 def run_rollout(policy, cell_features, pin_features, edge_list, env_config, args, mode, rollout_idx):
@@ -96,7 +95,21 @@ def evaluate_case(policy, case, device, args):
         )
         for rollout_idx in range(max(args.rollouts, 1))
     ]
-    audited = min(audited_candidates, key=candidate_key)
+    audited = (
+        select_by_exact_overlap_then_wirelength(
+            [
+                {
+                    "X": centers,
+                    "overlap_cells": score["overlap_cells"],
+                    "overlap_ratio": score["overlap_ratio"],
+                    "normalized_wl": score["normalized_wl"],
+                    "num_overlap_pairs": score["num_overlap_pairs"],
+                    "_rollout": (score, centers, info),
+                }
+                for score, centers, info in audited_candidates
+            ]
+        )["_rollout"]
+    )
     terminal_score = terminal[0]
     audited_score = audited[0]
     return {
@@ -148,7 +161,7 @@ def summarize(rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=default_device_arg())
     parser.add_argument("--cases", default="first10")
     parser.add_argument("--rollouts", type=int, default=4)
     parser.add_argument("--steps", type=int, default=32)

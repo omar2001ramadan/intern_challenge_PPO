@@ -37,6 +37,22 @@ def worker(gpu_id, args):
         str(args.lr),
         "--equivariance-coef",
         str(args.equivariance_coef),
+        "--distill-epochs",
+        str(args.distill_epochs),
+        "--distill-batch-size",
+        str(args.distill_batch_size),
+        "--distill-lr",
+        str(args.distill_lr),
+        "--distill-max-branch-pairs",
+        str(args.distill_max_branch_pairs),
+        "--teacher-lambda0",
+        str(args.teacher_lambda0),
+        "--teacher-anneal-updates",
+        str(args.teacher_anneal_updates),
+        "--teacher-aux-batch-size",
+        str(args.teacher_aux_batch_size),
+        "--teacher-aux-steps-per-update",
+        str(args.teacher_aux_steps_per_update),
         "--ordering-representation",
         args.ordering_representation,
         "--branch-mode",
@@ -54,7 +70,10 @@ def worker(gpu_id, args):
         "--log",
         f"{args.log_dir}/ppo_gpu{gpu_id}.jsonl",
     ]
+    if args.teacher_dataset:
+        cmd.extend(["--teacher-dataset", args.teacher_dataset])
     for flag, enabled in (
+        ("--metric-gated-hardening", args.metric_gated_hardening),
         ("--no-residual-flow", args.no_residual_flow),
         ("--no-phr-layer", args.no_phr_layer),
         ("--no-exact-audit", args.no_exact_audit),
@@ -83,6 +102,16 @@ def main():
     parser.add_argument("--global-flow-rank", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--equivariance-coef", type=float, default=0.001)
+    parser.add_argument("--teacher-dataset", default="")
+    parser.add_argument("--distill-epochs", type=int, default=0)
+    parser.add_argument("--distill-batch-size", type=int, default=1)
+    parser.add_argument("--distill-lr", type=float, default=1e-4)
+    parser.add_argument("--distill-max-branch-pairs", type=int, default=65_536)
+    parser.add_argument("--teacher-lambda0", type=float, default=1.0)
+    parser.add_argument("--teacher-anneal-updates", type=int, default=50)
+    parser.add_argument("--teacher-aux-batch-size", type=int, default=1)
+    parser.add_argument("--teacher-aux-steps-per-update", type=int, default=1)
+    parser.add_argument("--metric-gated-hardening", action="store_true")
     parser.add_argument("--no-residual-flow", action="store_true")
     parser.add_argument("--no-phr-layer", action="store_true")
     parser.add_argument("--no-exact-audit", action="store_true")

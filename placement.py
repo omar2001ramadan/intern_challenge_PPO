@@ -390,6 +390,8 @@ def _placement_device():
     requested = os.environ.get("PLACEMENT_DEVICE")
     if requested:
         return torch.device(requested)
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda:0")
     return torch.device("cpu")
@@ -398,7 +400,10 @@ def _placement_device():
 _POLICY_CACHE = {}
 
 
-def _policy_checkpoint_path():
+def _policy_checkpoint_path(policy_checkpoint=None):
+    if policy_checkpoint:
+        resolved = os.path.expanduser(str(policy_checkpoint))
+        return resolved if os.path.exists(resolved) else None
     use_policy = os.environ.get("PLACEMENT_USE_POLICY", "1").lower()
     if use_policy in {"0", "false", "no", "off"}:
         return None
@@ -503,31 +508,72 @@ def _policy_conditioned_transition_or_none(
     edge_list,
     *,
     device,
+    mode="audited_policy_ensemble",
+    num_rollouts=4,
+    num_steps=128,
+    temperature=0.35,
+    deterministic=False,
+    soft_relaxation=True,
+    relaxation="sigmoid",
+    policy_transition=True,
+    policy_checkpoint=None,
     verbose=False,
 ):
-    enabled = os.environ.get("PLACEMENT_POLICY_TRANSITION", "1").lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    if not policy_transition:
         return None
-    checkpoint_path = _policy_checkpoint_path()
+    checkpoint_path = _policy_checkpoint_path(policy_checkpoint=policy_checkpoint)
     if checkpoint_path is None:
         return None
 
     try:
         from env import EnvConfig, PlacementOrderingEnv
-        from ordering_policy import hierarchical_active_branch_weights, load_policy_checkpoint
+        from ordering_policy import (
+            DISCOVER_MODE_NAMES,
+            apply_rollout_memory_policy,
+            hierarchical_active_branch_weights,
+            load_policy_checkpoint,
+            rollout_memory_config_from_checkpoint,
+        )
 
         cache_key = (os.path.abspath(checkpoint_path), str(device), "transition")
         if cache_key not in _POLICY_CACHE:
-            _POLICY_CACHE[cache_key] = load_policy_checkpoint(checkpoint_path, device)[0]
-        policy = _POLICY_CACHE[cache_key]
+            _POLICY_CACHE[cache_key] = load_policy_checkpoint(checkpoint_path, device)
+        policy, checkpoint = _POLICY_CACHE[cache_key]
+        rollout_memory_cfg = rollout_memory_config_from_checkpoint(checkpoint)
 
-        mode = os.environ.get("PLACEMENT_INFERENCE_MODE", "audited_policy_ensemble")
-        rollouts = int(os.environ.get("PLACEMENT_POLICY_ROLLOUTS", "4"))
-        horizon = int(os.environ.get("PLACEMENT_POLICY_STEPS", "32"))
-        temperature = float(os.environ.get("PLACEMENT_POLICY_TEMPERATURE", "0.35"))
-        deterministic = os.environ.get("PLACEMENT_POLICY_DETERMINISTIC", "0").lower() in {"1", "true", "yes", "on"}
-        soft_relaxation = os.environ.get("PLACEMENT_POLICY_SOFT_RELAX", "1").lower() not in {"0", "false", "no", "off"}
-        relaxation = os.environ.get("PLACEMENT_POLICY_RELAXATION", "sigmoid")
+        mode = str(mode or os.environ.get("PLACEMENT_INFERENCE_MODE", "audited_policy_ensemble"))
+        rollouts = int(num_rollouts if num_rollouts is not None else os.environ.get("PLACEMENT_POLICY_ROLLOUTS", "4"))
+        horizon = int(num_steps if num_steps is not None else os.environ.get("PLACEMENT_POLICY_STEPS", "32"))
+        temperature = float(
+            temperature if temperature is not None else os.environ.get("PLACEMENT_POLICY_TEMPERATURE", "0.35")
+        )
+        deterministic = bool(deterministic)
+        soft_relaxation = bool(soft_relaxation)
+        relaxation = str(relaxation or os.environ.get("PLACEMENT_POLICY_RELAXATION", "sigmoid"))
+        memory_reset_mode = str(
+            os.environ.get("PLACEMENT_MEMORY_RESET_MODE", rollout_memory_cfg["memory_reset_mode"])
+        )
+        memory_reset_retain = float(
+            os.environ.get("PLACEMENT_MEMORY_RESET_RETAIN", str(rollout_memory_cfg["memory_reset_retain"]))
+        )
+        memory_reset_min_overlap_gain = float(
+            os.environ.get(
+                "PLACEMENT_MEMORY_RESET_MIN_OVERLAP_GAIN",
+                str(rollout_memory_cfg["memory_reset_min_overlap_gain"]),
+            )
+        )
+        memory_reset_min_pair_gain_count = float(
+            os.environ.get(
+                "PLACEMENT_MEMORY_RESET_MIN_PAIR_GAIN_COUNT",
+                str(rollout_memory_cfg["memory_reset_min_pair_gain_count"]),
+            )
+        )
+        memory_reset_min_steps_since_best = int(
+            os.environ.get(
+                "PLACEMENT_MEMORY_RESET_MIN_STEPS_SINCE_BEST",
+                str(rollout_memory_cfg["memory_reset_min_steps_since_best"]),
+            )
+        )
 
         env_config = EnvConfig(
             horizon=horizon,
@@ -543,53 +589,118 @@ def _policy_conditioned_transition_or_none(
         saved = []
         rollout_count = 1 if mode == "terminal_policy" else max(1, rollouts)
         for rollout_idx in range(rollout_count):
-            env = PlacementOrderingEnv(cell_features, pin_features, edge_list, env_config)
-            memory = policy.initial_memory(device)
-            for _step in range(horizon):
-                graph = env.graph_state(memory=memory)
-                with torch.no_grad():
-                    action = policy.sample_action(
-                        graph,
-                        temperature=temperature,
-                        deterministic=deterministic,
+            discover_modes = ("balanced",) if mode == "terminal_policy" else DISCOVER_MODE_NAMES
+            for discover_mode in discover_modes:
+                env = PlacementOrderingEnv(
+                    cell_features,
+                    pin_features,
+                    edge_list,
+                    env_config,
+                    discover_mode=discover_mode,
+                )
+                memory = policy.initial_memory(device)
+                initial_memory = memory.detach().clone()
+                for _step in range(horizon):
+                    graph = env.graph_state(memory=memory)
+                    with torch.no_grad():
+                        action = policy.sample_action(
+                            graph,
+                            temperature=temperature,
+                            deterministic=deterministic,
+                        )
+                        memory = action.next_memory.detach()
+                        soft_weights = None
+                        if soft_relaxation:
+                            soft_weights = hierarchical_active_branch_weights(
+                                action,
+                                graph["active_pairs"],
+                                relaxation=relaxation,
+                                tau=float(action.tau.detach().item()),
+                            ).detach()
+                    _reward, done, info = env.step_action(
+                        action,
+                        entropy=action.entropy,
+                        soft_branch_weights=soft_weights,
+                        soft_tau=float(action.tau.detach().item()),
                     )
-                    memory = action.next_memory.detach()
-                    soft_weights = None
-                    if soft_relaxation:
-                        soft_weights = hierarchical_active_branch_weights(
-                            action,
-                            graph["active_pairs"],
-                            relaxation=relaxation,
-                            tau=float(action.tau.detach().item()),
-                        ).detach()
-                _reward, done, info = env.step_action(
-                    action,
-                    entropy=action.entropy,
-                    soft_branch_weights=soft_weights,
-                    soft_tau=float(action.tau.detach().item()),
-                )
-                if done:
-                    break
+                    memory, _memory_reset_info = apply_rollout_memory_policy(
+                        action.next_memory,
+                        initial_memory,
+                        reset_mode=memory_reset_mode,
+                        reset_retain=memory_reset_retain,
+                        incumbent_improved=bool(info.get("incumbent_improved", False)),
+                        best_overlap_delta=float(info.get("best_overlap_delta", 0.0)),
+                        best_pair_delta_count=float(info.get("best_pair_delta_count", 0.0)),
+                        steps_since_best_before=int(info.get("steps_since_best_before", 0)),
+                        phase_transition=bool(info.get("phase_transition", False)),
+                        phase_transition_reason=str(info.get("phase_transition_reason", "")),
+                        phase_reset_retain=float(info.get("phase_reset_retain", memory_reset_retain)),
+                        event_reset=bool(info.get("refine_rejected", False) or info.get("rollback_to_incumbent", False)),
+                        event_reset_reason=(
+                            str(info.get("rollback_reason", "rollback_to_incumbent"))
+                            if bool(info.get("rollback_to_incumbent", False))
+                            else str(info.get("refine_reject_reason", "refine_rejected"))
+                        ),
+                        event_reset_retain=(
+                            0.10
+                            if bool(info.get("rollback_to_incumbent", False))
+                            else (0.25 if bool(info.get("refine_rejected", False)) else None)
+                        ),
+                        min_overlap_gain=memory_reset_min_overlap_gain,
+                        min_pair_gain_count=memory_reset_min_pair_gain_count,
+                        min_steps_since_best=memory_reset_min_steps_since_best,
+                    )
+                    if done:
+                        break
 
-            if mode == "terminal_policy":
-                score = _score_candidate(_write_positions(cell_features, env.centers), pin_features, edge_list)
-                saved.append((score, env.centers.detach().clone()))
-            else:
-                saved.append(env.best_candidate())
+                if mode == "terminal_policy":
+                    score = _score_candidate(_write_positions(cell_features, env.centers), pin_features, edge_list)
+                    refine_result = env.run_post_legal_refine_portfolio(env.centers.detach().clone(), policy=policy)
+                    score = dict(refine_result["score"])
+                    saved.append((score, refine_result["centers"].detach().clone(), discover_mode, str(refine_result["winning_variant"])))
+                else:
+                    score, centers = env.best_candidate()
+                    refine_result = env.run_post_legal_refine_portfolio(centers.detach().clone(), policy=policy)
+                    saved.append(
+                        (
+                            dict(refine_result["score"]),
+                            refine_result["centers"].detach().clone(),
+                            discover_mode,
+                            str(refine_result["winning_variant"]),
+                        )
+                    )
 
-            if verbose:
-                score, _centers = saved[-1]
-                print(
-                    f"Policy rollout {rollout_idx + 1}/{rollout_count}: "
-                    f"mode={mode} overlap={score['overlap_ratio']:.4f} "
-                    f"wl={score['normalized_wl']:.4f}"
-                )
+                if verbose:
+                    score, _centers, candidate_mode, refine_variant = saved[-1]
+                    print(
+                        f"Policy rollout {rollout_idx + 1}/{rollout_count}: "
+                        f"discover_mode={candidate_mode} mode={mode} overlap={score['overlap_ratio']:.4f} "
+                        f"wl={score['normalized_wl']:.4f} refine={refine_variant}"
+                    )
 
-        best_score, best_centers = min(saved, key=_candidate_key)
+        from rollout import select_by_exact_overlap_then_wirelength
+
+        selected = select_by_exact_overlap_then_wirelength(
+            [
+                {
+                    "X": centers,
+                    "overlap_cells": score["overlap_cells"],
+                    "overlap_ratio": score["overlap_ratio"],
+                    "normalized_wl": score["normalized_wl"],
+                    "num_overlap_pairs": score["num_overlap_pairs"],
+                    "discover_mode": discover_mode,
+                    "winning_refine_variant": winning_refine_variant,
+                    "_saved": (score, centers, discover_mode, winning_refine_variant),
+                }
+                for score, centers, discover_mode, winning_refine_variant in saved
+            ]
+        )
+        best_score, best_centers, best_discover_mode, best_refine_variant = selected["_saved"]
         if verbose:
             print(
-                f"Policy transition selected: overlap={best_score['overlap_ratio']:.4f} "
-                f"wl={best_score['normalized_wl']:.4f}"
+                f"Policy transition selected: discover_mode={best_discover_mode} "
+                f"overlap={best_score['overlap_ratio']:.4f} wl={best_score['normalized_wl']:.4f} "
+                f"refine={best_refine_variant}"
             )
         return best_centers
     except Exception as exc:
@@ -761,32 +872,47 @@ def train_placement(
     cell_features,
     pin_features,
     edge_list,
-    num_epochs=300,
-    lr=0.006,
-    lambda_wirelength=1.0,
-    lambda_overlap=24.0,
-    verbose=True,
+    num_rollouts=4,
+    num_steps=128,
+    temperature=0.35,
+    mode="audited_policy_ensemble",
+    verbose=False,
+    deterministic=False,
+    soft_relaxation=True,
+    relaxation="sigmoid",
+    policy_transition=True,
+    policy_checkpoint=None,
     log_interval=100,
+    **legacy_kwargs,
 ):
-    """Train placement with global ordering and a signed inequality AL layer.
+    """Run the declared policy-conditioned inference wrapper.
 
     Args:
         cell_features: [N, 6] tensor with cell properties
         pin_features: [P, 7] tensor with pin properties
         edge_list: [E, 2] tensor with edge connectivity
-        num_epochs: Number of optimization iterations
-        lr: Learning rate for Adam optimizer
-        lambda_wirelength: Weight for wirelength loss
-        lambda_overlap: Weight for overlap loss
+        num_rollouts: Number of policy-generated candidates for audited mode
+        num_steps: Maximum rollout horizon
+        temperature: Policy sampling temperature
+        mode: One of ``terminal_policy`` or ``audited_policy_ensemble``
         verbose: Whether to print progress
-        log_interval: How often to print progress
+        deterministic: Whether to disable policy sampling noise at inference
+        soft_relaxation: Whether to allow soft ordering relaxation in rollout
+        relaxation: Soft ordering relaxation family
+        policy_transition: Whether to execute the declared policy-conditioned transition
+        policy_checkpoint: Optional explicit checkpoint path. Falls back to env if omitted.
+        log_interval: Legacy compatibility argument; unused in the declared inference path
+        legacy_kwargs: Accepted for compatibility with earlier optimization-style wrappers
 
     Returns:
         Dictionary with:
-            - final_cell_features: Optimized cell positions
+            - final_cell_features: Final policy-selected cell positions
             - initial_cell_features: Original cell positions (for comparison)
-            - loss_history: Loss values over time
+            - loss_history: Declared run metadata
     """
+    if mode not in {"terminal_policy", "audited_policy_ensemble"}:
+        raise ValueError("mode must be 'terminal_policy' or 'audited_policy_ensemble'")
+
     input_device = cell_features.device
     device = _placement_device()
 
@@ -808,13 +934,31 @@ def train_placement(
         pin_features_device,
         edge_list_device,
         device=device,
+        mode=mode,
+        num_rollouts=num_rollouts,
+        num_steps=num_steps,
+        temperature=temperature,
+        deterministic=deterministic,
+        soft_relaxation=soft_relaxation,
+        relaxation=relaxation,
+        policy_transition=policy_transition,
+        policy_checkpoint=policy_checkpoint,
         verbose=verbose,
     )
     if policy_transition_centers is not None:
         return {
             "final_cell_features": _write_positions(base_cell_features, policy_transition_centers).to(input_device),
             "initial_cell_features": initial_cell_features.to(input_device),
-            "loss_history": {"total_loss": [], "wirelength_loss": [], "overlap_loss": []},
+            "loss_history": {
+                "total_loss": [],
+                "wirelength_loss": [],
+                "overlap_loss": [],
+                "declared_mode": [mode],
+                "declared_num_rollouts": [float(num_rollouts)],
+                "declared_num_steps": [float(num_steps)],
+                "declared_temperature": [float(temperature)],
+                "declared_policy_transition": [1.0 if policy_transition else 0.0],
+            },
         }
 
     best_score = _score_candidate(base_cell_features, pin_features_device, edge_list_device)
@@ -835,6 +979,11 @@ def train_placement(
             "official_overlap_ratio": [best_score["overlap_ratio"]],
             "official_normalized_wl": [best_score["normalized_wl"]],
             "declared_noop": [1.0],
+            "declared_mode": [mode],
+            "declared_num_rollouts": [float(num_rollouts)],
+            "declared_num_steps": [float(num_steps)],
+            "declared_temperature": [float(temperature)],
+            "declared_policy_transition": [1.0 if policy_transition else 0.0],
         },
     }
 

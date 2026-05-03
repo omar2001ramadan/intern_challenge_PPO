@@ -1,8 +1,8 @@
-"""Multi-GPU benchmark/training sweep for the placement challenge.
+"""Multi-GPU inference sweep for the policy-conditioned placement challenge.
 
-The design uses a deterministic sequence-pair policy plus a primal-dual
-coordinate layer. This runner sweeps primal-dual schedules across the first ten
-leaderboard cases and assigns jobs to the available GPUs.
+This runner evaluates a saved policy checkpoint across the benchmark cases using
+declared inference controls. It no longer relies on the legacy coordinate-stage
+environment variables that the current policy-conditioned path does not read.
 """
 
 import argparse
@@ -30,25 +30,25 @@ TEST_CASES = [
 
 PROFILES = {
     "quick": {
-        "PLACEMENT_PRIMAL_STEPS": "40",
-        "PLACEMENT_OUTER_STAGES": "2",
-        "PLACEMENT_RHO": "8.0",
-        "PLACEMENT_LR": "0.01",
-        "PLACEMENT_LAMBDA_OVERLAP": "10.0",
+        "PLACEMENT_POLICY_TRANSITION": "1",
+        "PLACEMENT_INFERENCE_MODE": "audited_policy_ensemble",
+        "PLACEMENT_POLICY_ROLLOUTS": "1",
+        "PLACEMENT_POLICY_STEPS": "16",
+        "PLACEMENT_POLICY_TEMPERATURE": "0.45",
     },
     "balanced": {
-        "PLACEMENT_PRIMAL_STEPS": "160",
-        "PLACEMENT_OUTER_STAGES": "4",
-        "PLACEMENT_RHO": "10.0",
-        "PLACEMENT_LR": "0.008",
-        "PLACEMENT_LAMBDA_OVERLAP": "16.0",
+        "PLACEMENT_POLICY_TRANSITION": "1",
+        "PLACEMENT_INFERENCE_MODE": "audited_policy_ensemble",
+        "PLACEMENT_POLICY_ROLLOUTS": "2",
+        "PLACEMENT_POLICY_STEPS": "24",
+        "PLACEMENT_POLICY_TEMPERATURE": "0.35",
     },
     "sharp": {
-        "PLACEMENT_PRIMAL_STEPS": "300",
-        "PLACEMENT_OUTER_STAGES": "5",
-        "PLACEMENT_RHO": "14.0",
-        "PLACEMENT_LR": "0.006",
-        "PLACEMENT_LAMBDA_OVERLAP": "24.0",
+        "PLACEMENT_POLICY_TRANSITION": "1",
+        "PLACEMENT_INFERENCE_MODE": "audited_policy_ensemble",
+        "PLACEMENT_POLICY_ROLLOUTS": "4",
+        "PLACEMENT_POLICY_STEPS": "32",
+        "PLACEMENT_POLICY_TEMPERATURE": "0.25",
     },
 }
 
@@ -67,9 +67,10 @@ def parse_cases(value):
     return [case for case in TEST_CASES if case[0] in selected]
 
 
-def worker(gpu_id, jobs, results, log_path):
+def worker(gpu_id, jobs, results, log_path, policy_checkpoint):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ["PLACEMENT_DEVICE"] = "cuda:0"
+    os.environ["PLACEMENT_POLICY_CHECKPOINT"] = policy_checkpoint
 
     from test import run_placement_test
 
@@ -134,7 +135,11 @@ def main():
     parser.add_argument("--profiles", default="quick,balanced,sharp")
     parser.add_argument("--cases", default="first10")
     parser.add_argument("--log-dir", default="training_logs")
+    parser.add_argument("--policy-checkpoint", default=os.environ.get("PLACEMENT_POLICY_CHECKPOINT", ""))
     args = parser.parse_args()
+
+    if not args.policy_checkpoint:
+        raise ValueError("--policy-checkpoint is required for the policy-conditioned sweep.")
 
     gpu_ids = [int(item) for item in args.gpus.split(",") if item.strip()]
     profile_names = [item.strip() for item in args.profiles.split(",") if item.strip()]
@@ -157,7 +162,7 @@ def main():
             jobs.put((profile_name, PROFILES[profile_name], case))
 
     workers = [
-        ctx.Process(target=worker, args=(gpu_id, jobs, results, str(log_path)))
+        ctx.Process(target=worker, args=(gpu_id, jobs, results, str(log_path), args.policy_checkpoint))
         for gpu_id in gpu_ids
     ]
 

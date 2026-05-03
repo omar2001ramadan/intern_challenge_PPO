@@ -98,8 +98,10 @@ def ppo_update(
     device = next(policy.parameters()).device
     gae_variance = float(advantages.var(unbiased=False).item()) if advantages.numel() > 0 else 0.0
     return_variance = float(returns.var(unbiased=False).item()) if returns.numel() > 0 else 0.0
+    return_scale = torch.clamp(returns.std(unbiased=False), min=1.0)
     advantages = advantages.to(device)
     returns = returns.to(device)
+    return_scale = return_scale.to(device)
 
     metrics = {
         "policy_loss": 0.0,
@@ -114,7 +116,10 @@ def ppo_update(
         "equivariance_loss": 0.0,
         "gae_variance": gae_variance,
         "return_variance": return_variance,
+        "nonfinite_action_terms": 0.0,
+        "skipped_minibatches": 0.0,
         "updates": 0,
+        "value_target_scale": float(return_scale.detach().item()),
     }
     group_metrics = {}
 
@@ -146,18 +151,24 @@ def ppo_update(
                 aggregate_log_ratio = torch.zeros((), dtype=advantage.dtype, device=device)
                 aggregate_old_new_kl = torch.zeros((), dtype=advantage.dtype, device=device)
                 for group, logprob in group_logprobs.items():
-                    old_logprob = transition.old_group_logprobs[group].detach()
-                    aggregate_log_ratio = aggregate_log_ratio + (logprob - old_logprob)
-                    aggregate_old_new_kl = aggregate_old_new_kl + (old_logprob - logprob)
+                    raw_logprob = logprob
+                    raw_old_logprob = transition.old_group_logprobs[group].detach().to(device)
+                    if (not torch.isfinite(raw_logprob).item()) or (not torch.isfinite(raw_old_logprob).item()):
+                        metrics["nonfinite_action_terms"] += 1
+                    logprob = torch.nan_to_num(raw_logprob, nan=0.0, posinf=20.0, neginf=-20.0)
+                    old_logprob = torch.nan_to_num(raw_old_logprob, nan=0.0, posinf=20.0, neginf=-20.0)
+                    logprob_delta = torch.clamp(logprob - old_logprob, min=-20.0, max=20.0)
+                    aggregate_log_ratio = aggregate_log_ratio + logprob_delta
+                    aggregate_old_new_kl = aggregate_old_new_kl + torch.clamp(old_logprob - logprob, min=-20.0, max=20.0)
                     token_count = float(transition.group_token_counts.get(group, group_token_counts[group]).detach().item())
                     normalizer = max(token_count, 1.0) ** 0.5
-                    log_ratio = (logprob - old_logprob) / normalizer
+                    log_ratio = logprob_delta / normalizer
                     ratio = torch.exp(torch.clamp(log_ratio, min=-20.0, max=20.0))
                     unclipped = ratio * advantage
                     clipped = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantage
                     group_policy_loss = -torch.minimum(unclipped, clipped)
-                    group_entropy = group_entropies[group] / normalizer
-                    group_kl = (old_logprob - logprob) / normalizer
+                    group_entropy = torch.nan_to_num(group_entropies[group] / normalizer, nan=0.0, posinf=20.0, neginf=0.0)
+                    group_kl = torch.clamp(old_logprob - logprob, min=-20.0, max=20.0) / normalizer
                     group_clipfrac = (torch.abs(ratio.detach() - 1.0) > clip_epsilon).float()
 
                     policy_loss_terms.append(group_policy_loss)
@@ -165,23 +176,32 @@ def ppo_update(
                     kl_terms.append(group_kl)
                     clipfrac_terms.append(group_clipfrac)
 
-                    group_metrics.setdefault(group, {"kl": 0.0, "entropy": 0.0, "clipfrac": 0.0, "count": 0})
+                    group_metrics.setdefault(
+                        group,
+                        {"ratio": 0.0, "log_ratio": 0.0, "kl": 0.0, "entropy": 0.0, "clipfrac": 0.0, "count": 0},
+                    )
+                    group_metrics[group]["ratio"] += ratio.detach().item()
+                    group_metrics[group]["log_ratio"] += log_ratio.detach().item()
                     group_metrics[group]["kl"] += group_kl.detach().item()
                     group_metrics[group]["entropy"] += group_entropy.detach().item()
                     group_metrics[group]["clipfrac"] += group_clipfrac.detach().item()
                     group_metrics[group]["count"] += 1
 
+                value = torch.nan_to_num(value, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
                 aggregate_ratio = torch.exp(torch.clamp(aggregate_log_ratio, min=-20.0, max=20.0))
                 aggregate_clipfrac = (torch.abs(aggregate_ratio.detach() - 1.0) > clip_epsilon).float()
                 policy_loss = torch.stack(policy_loss_terms).mean()
                 entropy = torch.stack(entropy_terms).sum()
                 approx_kl = torch.stack(kl_terms).mean()
                 clipfrac = torch.stack(clipfrac_terms).mean()
-                value_loss = F.mse_loss(value, returns[idx])
+                scaled_value = value / return_scale
+                scaled_return = returns[idx] / return_scale
+                value_loss = F.smooth_l1_loss(scaled_value, scaled_return)
                 if equivariance_coef > 0.0 and hasattr(policy, "equivariance_loss"):
                     equivariance_loss = policy.equivariance_loss(transition.graph)
                 else:
                     equivariance_loss = value_loss * 0.0
+                equivariance_loss = torch.nan_to_num(equivariance_loss, nan=0.0, posinf=1.0e4, neginf=0.0)
                 loss = (
                     policy_loss
                     + value_coef * value_loss
@@ -189,6 +209,9 @@ def ppo_update(
                     + kl_coef * approx_kl
                     + equivariance_coef * equivariance_loss
                 )
+                if not torch.isfinite(loss).item():
+                    metrics["skipped_minibatches"] += 1
+                    continue
 
                 losses.append(loss)
                 policy_losses.append(policy_loss.detach())
@@ -202,6 +225,8 @@ def ppo_update(
                 metrics["aggregate_kl"] += aggregate_old_new_kl.detach().item()
                 metrics["aggregate_clipfrac"] += aggregate_clipfrac.detach().item()
 
+            if not losses:
+                continue
             optimizer.zero_grad(set_to_none=True)
             total_loss = torch.stack(losses).mean()
             total_loss.backward()
@@ -222,7 +247,7 @@ def ppo_update(
     transition_updates = max(sum(values["count"] for values in group_metrics.values()) / max(len(group_metrics), 1), 1)
     result = {}
     for key, value in metrics.items():
-        if key in {"updates", "gae_variance", "return_variance"}:
+        if key in {"updates", "gae_variance", "return_variance", "value_target_scale"}:
             result[key] = value
         elif key.startswith("aggregate_"):
             result[key] = value / transition_updates
@@ -230,6 +255,8 @@ def ppo_update(
             result[key] = value / denom
     for group, values in group_metrics.items():
         count = max(values["count"], 1)
+        result[f"ratio_{group}"] = values["ratio"] / count
+        result[f"log_ratio_{group}"] = values["log_ratio"] / count
         result[f"kl_{group}"] = values["kl"] / count
         result[f"entropy_{group}"] = values["entropy"] / count
         result[f"clipfrac_{group}"] = values["clipfrac"] / count

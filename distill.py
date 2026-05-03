@@ -26,7 +26,15 @@ from ordering_policy import (
     load_policy_checkpoint,
     save_policy_checkpoint,
 )
-from teacher_data import load_teacher_dataset
+from teacher_data import load_teacher_dataset_payload
+
+
+def default_device_arg():
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
 
 
 @dataclass
@@ -46,6 +54,9 @@ class DistillConfig:
     value_coef: float = 0.25
     equivariance_coef: float = 0.001
     grad_clip: float = 1.0
+    teacher_aux_lr_scale: float = 0.10
+    teacher_aux_loss_cap: float = 256.0
+    teacher_aux_weight_cap: float = 0.25
     seed: int = 1234
 
 
@@ -314,12 +325,98 @@ def outcome_distill(
     return final
 
 
+def teacher_auxiliary_update(
+    policy: OrderingPolicy,
+    dataset: list[dict],
+    cfg: DistillConfig | None = None,
+    *,
+    optimizer: torch.optim.Optimizer,
+    lambda_teacher: float,
+    batch_size: int | None = None,
+    device: torch.device | None = None,
+    seed: int | None = None,
+) -> dict:
+    """Run one annealed teacher rehearsal step from the offline dataset."""
+    cfg = cfg or DistillConfig()
+    if not dataset or float(lambda_teacher) <= 0.0:
+        return {
+            "teacher_lambda": float(lambda_teacher),
+            "teacher_aux_loss": 0.0,
+            "teacher_aux_weighted_loss": 0.0,
+            "teacher_aux_batch_size": 0,
+        }
+    if device is None:
+        device = next(policy.parameters()).device
+    policy.to(device)
+    policy.train()
+
+    effective_batch = max(int(batch_size or cfg.batch_size), 1)
+    if effective_batch >= len(dataset):
+        batch = list(dataset)
+    else:
+        rng = random.Random(int(cfg.seed if seed is None else seed))
+        indices = list(range(len(dataset)))
+        rng.shuffle(indices)
+        batch = [dataset[index] for index in indices[:effective_batch]]
+
+    optimizer.zero_grad(set_to_none=True)
+    losses = []
+    rows = []
+    for sample in batch:
+        loss, stats = distillation_loss(policy, sample, cfg)
+        losses.append(loss)
+        rows.append(stats)
+    mean_loss = torch.stack(losses).mean()
+    mean_loss_value = float(mean_loss.detach().item())
+    effective_lambda = min(float(lambda_teacher), float(cfg.teacher_aux_weight_cap))
+    summary = _mean_stats(rows)
+    summary.update(
+        {
+            "teacher_lambda": float(lambda_teacher),
+            "teacher_aux_effective_lambda": float(effective_lambda),
+            "teacher_aux_loss": mean_loss_value,
+            "teacher_aux_batch_size": len(batch),
+        }
+    )
+    if (not math.isfinite(mean_loss_value)) or mean_loss_value > float(cfg.teacher_aux_loss_cap):
+        optimizer.zero_grad(set_to_none=True)
+        summary.update(
+            {
+                "teacher_aux_weighted_loss": 0.0,
+                "teacher_aux_skipped": 1.0,
+                "teacher_aux_lr_scale": float(cfg.teacher_aux_lr_scale),
+            }
+        )
+        return summary
+
+    original_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    lr_scale = max(min(float(cfg.teacher_aux_lr_scale), 1.0), 0.0)
+    for group, original_lr in zip(optimizer.param_groups, original_lrs):
+        group["lr"] = original_lr * lr_scale
+    weighted_loss = mean_loss * effective_lambda
+    weighted_loss.backward()
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(cfg.grad_clip))
+    optimizer.step()
+    for group, original_lr in zip(optimizer.param_groups, original_lrs):
+        group["lr"] = original_lr
+    optimizer.zero_grad(set_to_none=True)
+
+    summary.update(
+        {
+            "teacher_aux_weighted_loss": float(weighted_loss.detach().item()),
+            "teacher_aux_skipped": 0.0,
+            "teacher_aux_lr_scale": lr_scale,
+        }
+    )
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run outcome-only teacher distillation.")
     parser.add_argument("--teacher-dataset", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--resume-checkpoint", default="")
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=default_device_arg())
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -340,9 +437,20 @@ def main() -> None:
             global_flow_rank=args.global_flow_rank,
         ).to(device)
     cfg = DistillConfig(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
-    dataset = load_teacher_dataset(args.teacher_dataset)
+    dataset_payload = load_teacher_dataset_payload(args.teacher_dataset)
+    dataset = list(dataset_payload["samples"])
     stats = outcome_distill(policy, dataset, cfg, device=device)
-    save_policy_checkpoint(policy, args.output, config=asdict(cfg), stats=stats)
+    save_policy_checkpoint(
+        policy,
+        args.output,
+        config={
+            **asdict(cfg),
+            "teacher_dataset_path": args.teacher_dataset,
+            "teacher_dataset_version": int(dataset_payload.get("version", 0)),
+            "teacher_metadata": dataset_payload.get("metadata", {}),
+        },
+        stats=stats,
+    )
     print(json.dumps(stats, sort_keys=True), flush=True)
 
 

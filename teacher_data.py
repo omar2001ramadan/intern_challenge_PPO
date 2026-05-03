@@ -31,6 +31,14 @@ from induce_branches import sequence_pair_from_centers
 from placement import generate_placement_input
 
 
+def default_device_arg():
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
+
+
 @dataclass
 class TeacherQualityConfig:
     max_demo_overlap: float = 0.0
@@ -387,16 +395,70 @@ def save_teacher_dataset(dataset: Iterable[dict], path: str | os.PathLike, metad
     torch.save(payload, path)
 
 
-def load_teacher_dataset(path: str | os.PathLike) -> list[dict]:
+def load_teacher_dataset_payload(path: str | os.PathLike) -> dict:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         payload = torch.load(path, map_location="cpu")
     if isinstance(payload, dict) and "samples" in payload:
-        return list(payload["samples"])
-    if isinstance(payload, list):
+        payload = dict(payload)
+        payload.setdefault("version", 1)
+        payload.setdefault("metadata", {})
         return payload
+    if isinstance(payload, list):
+        return {
+            "version": 0,
+            "metadata": {},
+            "samples": payload,
+        }
     raise ValueError(f"Unsupported teacher dataset format in {path}")
+
+
+def load_teacher_dataset(path: str | os.PathLike) -> list[dict]:
+    return list(load_teacher_dataset_payload(path)["samples"])
+
+
+def summarize_teacher_dataset(dataset: Iterable[dict]) -> dict:
+    rows = list(dataset)
+    if not rows:
+        return {
+            "samples": 0,
+            "avg_overlap_ratio": 0.0,
+            "avg_normalized_wl": 0.0,
+            "avg_weight": 0.0,
+            "min_weight": 0.0,
+            "max_weight": 0.0,
+            "avg_branch_pairs": 0.0,
+            "avg_active_pairs": 0.0,
+            "zero_overlap_fraction": 0.0,
+            "dagger_fraction": 0.0,
+        }
+
+    overlaps = [float(sample.get("metrics", {}).get("overlap_ratio", 0.0)) for sample in rows]
+    wirelengths = [float(sample.get("metrics", {}).get("normalized_wl", 0.0)) for sample in rows]
+    weights = [float(torch.as_tensor(sample.get("weight", 1.0)).item()) for sample in rows]
+    branch_pairs = [
+        int(sample.get("branch_pairs", torch.empty((0, 2), dtype=torch.long)).shape[0])
+        for sample in rows
+    ]
+    active_pairs = [
+        int(sample.get("active_pair_labels", torch.empty((0, 2), dtype=torch.long)).shape[0])
+        for sample in rows
+    ]
+    dagger_count = sum(1 for sample in rows if bool(sample.get("dagger_source", False)))
+    zero_overlap = sum(1 for overlap in overlaps if overlap <= 0.0)
+    return {
+        "samples": len(rows),
+        "avg_overlap_ratio": sum(overlaps) / len(rows),
+        "avg_normalized_wl": sum(wirelengths) / len(rows),
+        "avg_weight": sum(weights) / len(rows),
+        "min_weight": min(weights),
+        "max_weight": max(weights),
+        "avg_branch_pairs": sum(branch_pairs) / len(rows),
+        "avg_active_pairs": sum(active_pairs) / len(rows),
+        "zero_overlap_fraction": zero_overlap / len(rows),
+        "dagger_fraction": dagger_count / len(rows),
+    }
 
 
 def _load_callable(spec: str):
@@ -423,10 +485,10 @@ def _make_synthetic_generator(sizes: list[tuple[int, int]], device: torch.device
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build an offline teacher outcome dataset.")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--teacher-solver", default="placement:train_placement")
+    parser.add_argument("--teacher-solver", default="prior_solver:train_prior_solver_placement")
     parser.add_argument("--num-cases", type=int, default=32)
     parser.add_argument("--sizes", default="2:20,3:25,2:30,3:50")
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=default_device_arg())
     parser.add_argument("--max-demo-overlap", type=float, default=0.0)
     parser.add_argument("--max-label-pairs", type=int, default=200_000)
     parser.add_argument("--allow-policy-teacher", action="store_true")
@@ -465,12 +527,20 @@ def main() -> None:
     metadata = {
         "quality_cfg": asdict(quality_cfg),
         "teacher_solver": args.teacher_solver,
+        "teacher_policy_disabled": not args.allow_policy_teacher,
         "sizes": args.sizes,
         "num_cases_requested": args.num_cases,
         "num_cases_accepted": len(dataset),
         "dagger_cases_requested": args.dagger_cases,
         "dagger_cases_accepted": sum(1 for sample in dataset if bool(sample.get("dagger_source", False))),
+        "dataset_summary": summarize_teacher_dataset(dataset),
     }
+    if not dataset:
+        raise RuntimeError(
+            "Teacher dataset is empty. Relax --max-demo-overlap or increase the "
+            "teacher optimization budget via PLACEMENT_TEACHER_MAX_ITERS / "
+            "PLACEMENT_TEACHER_STEP_SCALE / PLACEMENT_TEACHER_MARGIN."
+        )
     save_teacher_dataset(dataset, args.output, metadata=metadata)
     print(json.dumps(metadata, sort_keys=True), flush=True)
 

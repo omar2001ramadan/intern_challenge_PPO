@@ -1,7 +1,5 @@
 """Constraint and audit helpers for placement optimization."""
 
-import math
-
 import torch
 
 from induce_branches import Branch
@@ -204,7 +202,8 @@ def exact_overlap_pairs(cell_features, all_pair_limit=6000, chunk_size=2_000_000
     """Return every overlapping pair found by an exact audit.
 
     For the challenge's first ten tests, all-pairs vectorization is exact and
-    fast on GPU. Larger instances fall back to a conservative spatial hash.
+    fast on GPU. Larger instances use an exact device-resident sweep-and-prune
+    broad phase followed by exact overlap checks.
     """
     n = int(cell_features.shape[0])
     if n <= 1:
@@ -235,47 +234,59 @@ def _exact_overlap_pairs_all(cell_features, chunk_size):
 
 
 def _exact_overlap_pairs_spatial_hash(cell_features):
-    cpu_features = cell_features.detach().cpu()
-    centers = cpu_features[:, 2:4]
-    widths = cpu_features[:, 4]
-    heights = cpu_features[:, 5]
-    n = int(cpu_features.shape[0])
+    centers = cell_features[:, 2:4]
+    widths = cell_features[:, 4]
+    heights = cell_features[:, 5]
+    device = cell_features.device
+    n = int(cell_features.shape[0])
 
-    median_span = torch.median(torch.maximum(widths, heights)).item()
-    cell_size = max(median_span * 4.0, 1.0)
-    buckets = {}
+    if n <= 1:
+        return torch.empty((0, 2), dtype=torch.long, device=device)
 
     left = centers[:, 0] - 0.5 * widths
     right = centers[:, 0] + 0.5 * widths
     bottom = centers[:, 1] - 0.5 * heights
     top = centers[:, 1] + 0.5 * heights
 
-    for idx in range(n):
-        gx0 = math.floor(left[idx].item() / cell_size)
-        gx1 = math.floor(right[idx].item() / cell_size)
-        gy0 = math.floor(bottom[idx].item() / cell_size)
-        gy1 = math.floor(top[idx].item() / cell_size)
-        for gx in range(gx0, gx1 + 1):
-            for gy in range(gy0, gy1 + 1):
-                buckets.setdefault((gx, gy), []).append(idx)
+    order = torch.argsort(left)
+    left_sorted = left[order]
+    right_sorted = right[order]
+    bottom_sorted = bottom[order]
+    top_sorted = top[order]
+    range_end = torch.searchsorted(left_sorted, right_sorted, right=False)
 
-    candidate_pairs = set()
-    for members in buckets.values():
-        if len(members) < 2:
+    hits = []
+    chunk = 2048
+    for start in range(0, n, chunk):
+        row_idx = torch.arange(start, min(start + chunk, n), device=device)
+        counts = torch.clamp(range_end[row_idx] - row_idx - 1, min=0)
+        if not torch.any(counts > 0):
             continue
-        for a_pos in range(len(members)):
-            a = members[a_pos]
-            for b in members[a_pos + 1 :]:
-                i, j = (a, b) if a < b else (b, a)
-                candidate_pairs.add((i, j))
 
-    if not candidate_pairs:
-        return torch.empty((0, 2), dtype=torch.long, device=cell_features.device)
+        max_count = int(counts.max().item())
+        offsets = torch.arange(max_count, device=device)
+        candidate_cols = row_idx[:, None] + 1 + offsets[None, :]
+        mask = offsets[None, :] < counts[:, None]
+        candidate_cols = candidate_cols[mask]
+        candidate_rows = torch.repeat_interleave(row_idx, counts)
 
-    pairs = torch.tensor(sorted(candidate_pairs), dtype=torch.long)
-    overlaps = pair_overlap_areas(centers, widths, heights, pairs)
-    pairs = pairs[overlaps > 0]
-    return pairs.to(cell_features.device)
+        overlap_y = torch.minimum(top_sorted[candidate_rows], top_sorted[candidate_cols]) - torch.maximum(
+            bottom_sorted[candidate_rows],
+            bottom_sorted[candidate_cols],
+        )
+        keep = overlap_y > 0
+        if not torch.any(keep):
+            continue
+
+        src = order[candidate_rows[keep]]
+        dst = order[candidate_cols[keep]]
+        lo = torch.minimum(src, dst)
+        hi = torch.maximum(src, dst)
+        hits.append(torch.stack([lo, hi], dim=1))
+
+    if not hits:
+        return torch.empty((0, 2), dtype=torch.long, device=device)
+    return torch.unique(torch.cat(hits, dim=0), dim=0)
 
 
 def overlap_ratio_from_pairs(n, pairs):
